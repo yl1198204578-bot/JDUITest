@@ -1,0 +1,240 @@
+
+--- A. 元信息 / 常量 / 源码合规 / 平台发现 ---
+PASS A1 模块名
+PASS A2 图标是彩色 emoji（不是汉字）
+PASS A3 描述含【特价】
+PASS A4 描述含【领券中心】
+PASS A5 描述含【领更多】
+PASS A6 描述含【完成得Y京豆】
+PASS A7 描述含 12~15 秒
+PASS A8 按钮白名单严格三项
+PASS A9 白名单不含完成态
+PASS A10 入口文案含 更多任务/领更多/天天领豆
+PASS A11 弹窗标题标记
+PASS A12 风控标记
+PASS A13 浮层标记
+PASS A14 任务可视安全区
+PASS A15 按钮贴右区间
+PASS A16 左对齐区间
+PASS A17 停留 12~15s 随机
+PASS A18 短滑动（不能滚掉弹窗）
+PASS A19 浮层 X 参考坐标
+PASS A20 OCR 裁掉弹窗以上区域
+PASS A21 五重上限保护齐全
+PASS A22 正则命中两种京豆奖励文案
+PASS A23 正则排除抽奖/超低价文案
+PASS A24 进度正则命中中英文括号
+PASS A25 价格排除正则
+PASS A26.1 源码无 send_keys
+PASS A26.2 源码无 mobile: type
+PASS A26.3 源码无 unicodeKeyboard
+PASS A26.4 源码无 By.ID
+PASS A26.5 源码无 By.CLASS_NAME
+PASS A26.6 源码无 find_element
+PASS A26.7 源码无 switch_to
+PASS A26.8 源码无 -android uiautomator
+PASS A26.9 源码无 adb shell input text
+PASS A26.10 源码无 set_clipboard
+PASS A26.11 源码无 XPath
+PASS A26.12 源码无 xpath
+PASS A27 OCR 是懒加载（模块顶层不 import paddleocr）
+PASS A28 源码有随机停留
+PASS A29 源码有进度归一化台账
+PASS A30 源码有 stop_event 中断
+PASS A31 源码有 log.done
+PASS A32 源码无领奖流程（需求没要求，ALL_BTN_TEXTS 里的文案只是签名用）
+PASS A33 源码有关键方法
+PASS A34 平台动态发现到 task14
+PASS A35 平台所有卡片图标都不是纯汉字
+
+--- B. dwell_seconds / 基础工具 ---
+PASS B1 固定 12 返回 12
+PASS B2 固定 13 返回 13
+PASS B3 固定 14 返回 14
+PASS B4 固定 15 返回 15
+PASS B5 全部落在 12~15
+PASS B6 四个取值都出现过（不是常量）
+PASS B7 norm 压空白/换行
+PASS B8 valid 正确
+PASS B9 center 取整
+PASS B10 REWARD_RE 提取京豆数
+
+--- C. classify 真机页面判定 ---
+PASS C1 首页 -> home
+PASS C2 特价页 -> tejia
+PASS C3 恭喜获得浮层 -> float
+PASS C4 领券中心底页 -> center
+PASS C5 XML 无弹窗节点的盲帧仍判 center（靠 OCR 兜底）
+PASS C6 任务弹窗 -> panel
+PASS C7 弹窗滚动帧 -> panel
+PASS C8 弹窗第 4 屏 -> panel
+PASS C9 浏览后 back 回来 -> panel
+PASS C10 落地页 -> other
+PASS C11 风控页 -> verify
+PASS C12 空节点 -> other
+PASS C13 弹窗优先级高于 center（两页节点混叠）
+PASS C14 verify 优先级最高
+PASS C15 单看常驻节点不会误判浮层
+
+--- D. in_list / is_button 安全区与白名单 ---
+PASS D1 首行按钮在可视区
+PASS D2 弹窗顶部裁掉的行 y=926 被排除
+PASS D3 背景页 y=532/728 被排除
+PASS D4 底栏遮挡的 y=2292 被排除
+PASS D5 x1 < 800 被排除
+PASS D6 x2 > 1060 被排除
+PASS D7 退化 bounds 被排除
+PASS D8 边界值 y1=1050 / y2=2168 仍可用
+PASS D9.1 白名单按钮 去浏览 命中
+PASS D9.2 白名单按钮 逛一逛 命中
+PASS D9.3 白名单按钮 去完成 命中
+PASS D10 XML 里 clickable=false 的 TextView 也算按钮
+PASS D11 非白名单按钮排除
+PASS D12 落地页的【去完成】不因坐标误入（页面未判 panel）
+PASS D13 is_button 不误收弹窗头部【我的奖励】
+
+--- E. reward_of / row_title 同行配对 ---
+PASS E1 京豆行取到 2 京豆
+PASS E2 京豆行取到正确标题
+PASS E3 抽奖任务行没有京豆奖励
+PASS E4 SK-II 广告行没有京豆奖励
+PASS E5 享券后超低价行没有京豆奖励
+PASS E6 浏览6S抽奖行没有京豆奖励
+PASS E7 纯【完成得2京豆】也能命中
+PASS E8 背景页价格文案抢不走标题
+PASS E9 背景页京豆文案抢不走奖励
+PASS E10 上一行奖励不会被当成下一行标题
+PASS E11 按钮上方 200px 的隔行标题不参与配对
+PASS E12 空 nodes 返回空标题/零奖励
+
+--- F. parse_rows 逐屏精确断言 ---
+PASS F1 首屏 2 个可做任务
+PASS F2 首屏标题精确
+PASS F3 首屏都是 2 京豆
+PASS F4 首屏按钮都是【去完成】
+PASS F5 首屏坐标
+PASS F6.1 排除非京豆任务 完成任务获得抽奖机会
+PASS F6.2 排除非京豆任务 SK-II
+PASS F6.3 排除非京豆任务 享券后超低价
+PASS F6.4 排除非京豆任务 浏览6S获得抽奖机会
+PASS F6.5 排除非京豆任务 每日分享领红包
+PASS F7 所有行都在安全区内
+PASS F8 滚动屏 4 个可做任务
+PASS F9 滚动屏 y 精确
+PASS F10 滚动屏绝不返回被裁掉的 532/728/926 行
+PASS F11 滚动屏含【浏览页面得京豆】
+PASS F12 滚动屏含纯【完成得2京豆】奖励
+PASS F13 第 4 屏 5 个可做任务
+PASS F14 第 4 屏全是 2 京豆
+PASS F15 任务池补位存在重复标题（必须靠上限兜底）
+PASS F16 浏览后 back 回到弹窗仍有 4 个可做任务
+PASS F17 浏览后进度 (1/5) -> (2/5)
+PASS F18 进度变化但台账 key 不变
+PASS F19.1 非弹窗页 parse_rows 为空
+PASS F19.2 非弹窗页 parse_rows 为空
+PASS F19.3 非弹窗页 parse_rows 为空
+PASS F19.4 非弹窗页 parse_rows 为空
+PASS F19.5 非弹窗页 parse_rows 为空
+PASS F19.6 非弹窗页 parse_rows 为空
+PASS F20 空 nodes
+
+--- G. OCR 兜底通道 ---
+PASS G1 三张 OCR 夹具都识别到弹窗标题
+PASS G2 空 OCR 结果不算弹窗
+PASS G3 无弹窗标题的 OCR 结果不产生任务
+PASS G4 OCR 首屏 2 个可做任务
+PASS G5 OCR 首屏与 XML 通道标题一致
+PASS G6 OCR 首屏与 XML 通道 key 一致
+PASS G7 OCR 带 8+1 噪声仍能取到 2 京豆
+PASS G8 OCR 排除抽奖任务
+PASS G9 OCR 滚动屏 4 个可做任务
+PASS G10 OCR 滚动屏与 XML 通道 y 接近（<=10px）
+PASS G11 OCR 全角括号不影响 key
+PASS G12 OCR 第 4 屏能做出任务（OCR 误识别只丢 1 行）
+PASS G13 OCR 行都在安全区
+PASS G14 OCR 通道按钮中心可直接用于 adb_tap
+
+--- H. panel_sig / ocr_sig ---
+PASS H1 弹窗首屏 7 个按钮进签名
+PASS H2 滚动后签名变化
+PASS H3 非弹窗页签名为空
+PASS H4 签名是排序过的 tuple
+PASS H5 进度变化不影响签名（按钮坐标不变）
+PASS H6 OCR 签名非空
+PASS H7 OCR 签名稳定可比较
+PASS H8 OCR 签名不含误读的【去元成】
+PASS H9 空 OCR 签名为空
+
+--- I. task_key / pick_target ---
+PASS I1 进度变化 key 不变
+PASS I2 不同标题 key 不同
+PASS I3 不同按钮 key 不同
+PASS I4 空标题也能成 key
+PASS I5 无黑名单挑第一行
+PASS I6 黑名单跳过
+PASS I7 全拉黑返回 None
+PASS I8 单任务次数达上限跳过
+PASS I9 自定义上限生效
+PASS I10 空 rows 返回 None
+
+--- J. 模块方法 ---
+PASS J1 _top_tab 动态定位一级 tab
+PASS J2 _coupon_tab 取到可点父容器
+PASS J3 _find_entry 找到【更多任务】卡片
+PASS J4 _clickable_container 无容器返回 None
+PASS J5 _need_ocr 未点入口时关闭
+PASS J6 未点入口的 center 帧不误判成弹窗
+PASS J7 未点入口时连 OCR 都不触发
+PASS J8 点过入口后仅 center 盲帧走 OCR
+PASS J9 盲帧经 OCR 兜底识别为 panel
+PASS J10 盲帧 OCR 拿到 3 个可做任务
+PASS J11 OCR 预算被扣减
+PASS J12 _reach_center 从首页走到领券中心（顺手关掉浮层）
+PASS J13 _clear_float 点 X 后回到 center
+PASS J14 _tap_entry 点在卡片下缘【领更多】
+PASS J15 _open_panel 从 center 打开面板
+
+--- K. 完整 run() 状态机 ---
+PASS K1 正常流程 log.done 被调用
+PASS K2 没有 ERROR
+PASS K3 冷启动后走完整入口链路
+PASS K4 3 个可做任务全做完
+PASS K5 每个任务恰好一次 back
+PASS K6 只打开了 1 次面板（没被反复重建）
+PASS K7 日志报告 3 次浏览
+PASS K8 没有真建 Appium session
+PASS K9 自然终态：日志有「没有可做任务」
+PASS K10 所有停留秒数落在 12~15
+PASS K11 浮层场景先关浮层再做任务
+PASS K12 浮层场景正常收尾
+PASS K13 盲帧场景确实调用了 OCR 兜底
+PASS K14 盲帧场景也做完 3 个任务
+PASS K15 盲帧场景正常收尾
+PASS K16 盲帧场景点的是 OCR 行长出的按钮中心
+PASS K17 任务池无限补位时由上限收尾（不会死循环）
+PASS K18 补位场景正常收尾
+PASS K19 风控页立即停止，不再继续做任务
+PASS K20 风控页有明确告警
+PASS K21 back 回不来时重建弹窗而不是掐断整轮
+PASS K22 重建场景正常收尾
+PASS K23 stop_event 能中断循环
+PASS K24 中断后仍然 log.done
+PASS K25 MAX_TASKS 硬上限生效
+PASS K26 触顶有告警
+PASS K27 开局就没有京豆任务时 0 次浏览直接收尾
+
+--- L. 需求合规 ---
+PASS L1 所有任务点击都落在【完成得Y京豆】行按钮上
+PASS L2 抽奖任务行的按钮一次都没点
+PASS L3 每次浏览的停留秒数都是 12~15 随机（非常量）
+PASS L4 点击后只 back 一次再回弹窗
+PASS L5 循环终止条件是「扫完没有可做任务」，不是固定次数
+PASS L6 没有写死浏览时长常量
+PASS L7 源码明确排除抽奖类任务
+PASS L8 源码有 OCR 兜底但预算封顶
+PASS L9 源码用短滑动避免滚掉弹窗
+PASS L10 源码有进度归一化 key（补位任务不会死循环）
+
+================ 汇总 ================
+PASS 212 / FAIL 0 / TOTAL 212
+ALL GREEN

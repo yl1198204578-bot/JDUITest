@@ -1,0 +1,39 @@
+# -*- coding: utf-8 -*-
+"""把 4 个汉字卡片图标换成同风格彩色 emoji；.py 透明加密，走 Python 明文读写。"""
+import io
+import os
+import py_compile
+
+BACKUP = ".workbuddy-ai/_backup_icons_20261113"
+if not os.path.isdir(BACKUP):
+    os.makedirs(BACKUP)
+
+# (模块文件, 明文副本, 旧 icon 行, 新 icon 行, 新图标)
+PAIRS = [
+    ("modules/task11_subsidy.py", "_task11_src.txt",
+     u'    icon = u"补"', u'    icon = u"\\U0001F4B0"', u"\U0001F4B0"),
+    ("modules/task12_gift.py", "_task12_src.txt",
+     u'    icon = u"礼"', u'    icon = u"\\U0001F9E7"', u"\U0001F9E7"),
+    ("modules/task13_female.py", "_task13_src.txt",
+     u'    icon = u"女"', u'    icon = u"\\U0001F457"', u"\U0001F457"),
+    ("modules/task3_farm_drops.py", "_task3_farm_drops_src.txt",
+     u'    icon = "水滴"', u'    icon = u"\\U0001F4A7"', u"\U0001F4A7"),
+]
+
+for py, txt, old, new, icon in PAIRS:
+    s = io.open(py, encoding="utf-8").read()
+    if old not in s:
+        raise RuntimeError("icon line not found in %s: %r" % (py, old))
+    s2 = s.replace(old, new, 1)
+
+    bak = os.path.join(BACKUP, os.path.basename(py) + ".bak")
+    io.open(bak, "w", encoding="utf-8", newline="\n").write(s)
+
+    io.open(txt, "w", encoding="utf-8", newline="\n").write(s2)
+    os.remove(py)
+    io.open(py, "w", encoding="utf-8", newline="\n").write(s2)
+    py_compile.compile(py, doraise=True)
+    print("OK %-34s %s -> %s  (%s)" %
+          (py, old.strip(), new.strip(), icon.encode("unicode_escape")))
+
+print("backup dir:", BACKUP)

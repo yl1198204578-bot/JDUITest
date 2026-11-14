@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+"""真机采集【京东好礼】路径的一次性脚本。
+
+用法：
+  python _probe_gift.py <action> [<action> ...]
+动作（坐标一律用 1080x2340 基准，运行时按 ui.sx/ui.sy 缩放）：
+  restart:<sec>              冷启动回首页
+  sleep:<sec>
+  dump:<name>                保存 XML + PNG，并打印全部文本/描述节点
+  brief:<name>               只保存 + 打印关键字命中
+  tap:<x>:<y>:<sec>
+  back:<sec>
+  swipe:<x1>:<y1>:<x2>:<y2>:<sec>
+"""
+import io
+import os
+import sys
+import time
+
+import utils.driver as driver
+from utils.jd_ui import JDUI
+
+OUT = os.path.dirname(os.path.abspath(__file__))
+d = driver.get_driver()
+ui = JDUI(d)
+print("分辨率 %dx%d" % (ui.W, ui.H))
+
+KWS = [u"新品", u"送礼新品", u"好礼许愿", u"抽", u"好礼许愿机", u"赚次数",
+       u"做任务获得许愿次数", u"今日任务", u"中奖记录", u"逛一逛", u"去完成",
+       u"浏览", u"许愿次数", u"浏览票数", u"已完成", u"领取", u"规则"]
+
+
+def save(name, brief=False):
+    ui.invalidate()
+    xml = ui.source(fresh=True)
+    xp = os.path.join(OUT, "_probe_gift_%s.xml" % name)
+    with io.open(xp, "w", encoding="utf-8") as f:
+        f.write(xml)
+    png = os.path.join(OUT, "_probe_gift_%s.png" % name)
+    try:
+        ui.d.get_screenshot_as_file(png)
+    except Exception as e:
+        print("  screenshot err %s" % e)
+    ns = ui.nodes(xml)
+    print("=== %s  chars=%d nodes=%d ===" % (name, len(xml), len(ns)))
+    if brief:
+        for kw in KWS:
+            hits = [(n["text"], n["desc"], n["bounds"], n["clickable"])
+                    for n in ns
+                    if kw in (n["text"] or "") or kw in (n["desc"] or "")]
+            if hits:
+                print("  KW %-12r -> %d : %s" % (kw, len(hits), hits[:5]))
+        return ns
+    cnt = 0
+    for n in ns:
+        t = (n["text"] or "").strip()
+        ds = (n["desc"] or "").strip()
+        if t or ds:
+            cnt += 1
+            if cnt <= 160:
+                print("  %-36r desc=%-34r click=%-5s cls=%-12s %s"
+                      % (t[:36], ds[:34], n["clickable"],
+                         (n["class"] or "").rsplit(".", 1)[-1][:12],
+                         n["bounds"]))
+    print("  ... 文本节点共 %d" % cnt)
+    return ns
+
+
+def num(parts, i, default):
+    return float(parts[i]) if len(parts) > i and parts[i] else default
+
+
+for act in sys.argv[1:]:
+    p = act.split(":")
+    op = p[0]
+    print(">>> %s" % act)
+    if op == "restart":
+        ui.restart_to_home()
+        ui.sleep(num(p, 1, 3))
+    elif op == "sleep":
+        ui.sleep(num(p, 1, 2))
+    elif op == "tap":
+        x, y = ui.sx(int(p[1])), ui.sy(int(p[2]))
+        print("    tap real (%d,%d)" % (x, y))
+        ui.adb_tap((x, y), pause=num(p, 3, 2.0))
+    elif op == "back":
+        ui.back(pause=num(p, 1, 2.0))
+    elif op == "swipe":
+        ui.adb_swipe(ui.sx(int(p[1])), ui.sy(int(p[2])),
+                     ui.sx(int(p[3])), ui.sy(int(p[4])), duration=450)
+        ui.sleep(num(p, 5, 1.5))
+    elif op == "dump":
+        save(p[1])
+    elif op == "brief":
+        save(p[1], brief=True)
+    else:
+        print("unknown action %r" % act)
+
+print("DONE")

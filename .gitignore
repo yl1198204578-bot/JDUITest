@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+config.local.json
+*.log
+
+# ==== 本地调试产物 / 私有数据（不入库，2026-11-14）====
+# WorkBuddy / Claude 本地记忆与配置
+.workbuddy-ai/
+.workbuddy/
+.claude/
+
+# 真机探针 dump、调试截图、历史备份（体积大且含 App 界面）
+_probe_*
+debug_shots/
+_archive/
+_*.log
+_appium_stdout.txt
+_shot_raw.bin
+_now.png
+
+# 缓存与备份
+*.bak
+*.bin
+*.pyc
+
+# 本地临时截图（回归夹具 _fixture_*.png 仍会入库）
+_*.png
+!_fixture_*.png

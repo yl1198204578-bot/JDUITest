@@ -1,0 +1,856 @@
+# -*- coding: utf-8 -*-
+"""京东 App 公共导航层。
+
+背景（实测 2026-11-10，设备 1080x2340，京东 App + Appium 3.9/uiautomator2 8.7.3）：
+- 首页金刚区是原生节点，可用 content-desc 精确定位。
+- 【全部频道】【优惠权益】【秒杀】等页面是 WebView，H5 内容不透出无障碍节点，
+  只能按标定坐标点击；这些页面统一按 1080x2340 参考分辨率存坐标，运行时按比例缩放。
+- 【天天领豆】的任务弹窗是原生节点，text="去浏览" 可精确枚举，用坐标中心点击。
+- Appium 3.9 + Appium-Python-Client 2.11.1 下 find_elements 的
+  -android uiautomator / xpath 策略会报 "selector is not present in JSON"，
+  所以统一改为「解析 page_source -> 取 bounds -> tap 坐标」，不依赖元素定位。
+"""
+import os
+import re
+import time
+import xml.etree.ElementTree as ET
+
+REF_W = 1080
+REF_H = 2340
+
+# 参考分辨率下标定的点击坐标（H5 页面无节点，只能坐标）
+POINTS = {
+    # 2026-11-12 真机重标定：旧值 (407,765)/(153,530) 已失效
+    # 优惠权益 tab 实际在 (405,308)；765 落在便民服务网格里，点了没反应
+    # 优惠权益网格首行是 京补合约/秒杀/试用领取，秒杀在 (328,529)
+    "coupon_tab": (405, 308),       # 全部频道页 -> 【优惠权益】tab
+    "seckill": (328, 529),          # 优惠权益网格 -> 【秒杀】（1 行 2 列）
+    "earn_beans": (248, 659),       # 秒杀页 -> 【赚更多京豆】
+    "all_tasks": (944, 814),        # 天天领豆页 -> 【全部任务】
+    "all_channels": (973, 1004),    # [已废弃] 旧版固定坐标兜底，仅保留兼容
+    "quick_verify": (540, 998),     # 京东风控页 -> 【快速验证】
+}
+
+SWIPES = {
+    "kingkong": ((970, 520), (500, 520)),      # [已废弃] 旧版固定 y；swipe("kingkong") 已委托动态滑动
+    "task_list": ((540, 2050), (540, 1380)),   # 任务弹窗内向上滚动（看后面的任务）
+    "task_list_down": ((540, 1380), (540, 2050)),  # 反向滑回列表顶部
+    "task_cards": ((900, 620), (200, 620)),       # 天天领豆【任务卡】轮播左滑切下一张
+}
+
+# 金刚区小图标的 content-desc 锚点。用户 2026-11-11 确认：首页那排
+# 「秒杀 / 超级补贴 / 9.9包邮 / 直播 / 外卖 / 试用」小图标就是金刚区，
+# 它的位置与排序会随首页改版变动，不能再用固定 y 坐标去滑动。
+# 识别以「同 y 带 + 可点击 + 多个格子」的结构特征为主，【秒杀】作首选锚点。
+KINGKONG_ANCHOR_DESCS = ("秒杀", "超级补贴", "9.9包邮", "直播", "外卖",
+                         "试用", "种豆得豆", "家电家居", "京喜自营", "京东保")
+MAX_KINGKONG_SWIPES = 4       # 左滑金刚区找【全部频道】的最大次数
+
+
+class JDUI(object):
+    """封装页面判断、坐标点击、节点解析、公共导航。"""
+
+    def __init__(self, driver, log=None, stop_event=None, package="com.jingdong.app.mall"):
+        self.d = driver
+        self.log = log
+        self.stop = stop_event
+        self.package = package
+        self.W, self.H = self._screen_size(driver)
+        self._restarted = False  # 本实例是否已做过冷启动，避免重复重启
+        # page_source 在京东 H5 页很慢（实测 10~20s），短 TTL 缓存把同一时刻的
+        # 多次判断合并成一次 dump；所有会改变界面的操作都会主动让缓存失效。
+        self._xml_cache = None
+        self._xml_ts = 0.0
+        self._xml_ttl = 0.8
+        # 让标题栏等节点进入 page_source，便于判断当前页面；失败不影响主流程
+        try:
+            driver.update_settings({
+                "ignoreUnimportantViews": False,
+                "allowInvisibleElements": True,
+                # 天天领豆是持续动画的 H5 页，UiAutomator 默认等 10s 空闲，
+                # 实测每次 page_source 要 10~21s。调到 500ms 后约 2s，
+                # XML 内容/节点完全一致，只是不再干等动画结束。
+                "waitForIdleTimeout": 500,
+            })
+        except Exception:
+            pass
+
+    # ---------- 基础 ----------
+    def say(self, msg, level="INFO"):
+        if self.log is not None:
+            self.log.write_log(msg, level)
+        else:
+            print("[%s] %s" % (level, msg))
+
+    def sleep(self, seconds):
+        """可被 stop_event 中断的等待，返回 False 表示被中断。"""
+        end = time.time() + float(seconds)
+        while time.time() < end:
+            if self.stop is not None and self.stop.is_set():
+                return False
+            time.sleep(min(0.5, max(0.02, end - time.time())))
+        return not (self.stop is not None and self.stop.is_set())
+
+    @staticmethod
+    def _screen_size(driver):
+        """Appium 3.9 下 get_window_size 不可用，改从截图 PNG 头读真实分辨率。"""
+        try:
+            import struct
+            png = driver.get_screenshot_as_png()
+            return (struct.unpack(">I", png[16:20])[0],
+                    struct.unpack(">I", png[20:24])[0])
+        except Exception:
+            return (REF_W, REF_H)
+
+    def sx(self, x):
+        return int(round(x * self.W / float(REF_W)))
+
+    def sy(self, y):
+        return int(round(y * self.H / float(REF_H)))
+
+    def tap(self, key_or_xy, pause=1.5):
+        """统一用 adb input tap 原生注入：Appium W3C tap 在京东 H5 页偶发被吞。"""
+        if isinstance(key_or_xy, str):
+            x, y = POINTS[key_or_xy]
+            x, y = self.sx(x), self.sy(y)
+        else:
+            x, y = int(key_or_xy[0]), int(key_or_xy[1])
+        self.adb_tap((x, y), pause=pause)
+
+    def adb_tap(self, key_or_xy, pause=1.5, settle=None):
+        """用 adb input tap 原生注入点击（Appium W3C tap 在 H5 上偶发被吞）。"""
+        import subprocess, shutil
+        _adb = getattr(self, '_adb_path', None)
+        if not _adb:
+            _adb = shutil.which("adb")
+            if not _adb:
+                import os
+                _adb = os.path.join(os.environ.get("ANDROID_HOME", ""), "platform-tools", "adb.exe")
+                if not os.path.isfile(_adb):
+                    _adb = os.path.join(os.environ.get("ANDROID_SDK_ROOT", ""), "platform-tools", "adb.exe")
+                if not os.path.isfile(_adb):
+                    _adb = "adb"
+            self._adb_path = _adb
+        if isinstance(key_or_xy, str):
+            x, y = POINTS[key_or_xy]
+            x, y = self.sx(x), self.sy(y)
+        else:
+            x, y = int(key_or_xy[0]), int(key_or_xy[1])
+        cmd = [_adb, "shell", "input", "tap", str(x), str(y)]
+        for attempt in range(3):
+            try:
+                subprocess.call(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=8)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    self.say("adb 点击超时/失败，重试 %d/2" % (attempt + 1), "WARN")
+                    time.sleep(1)
+                else:
+                    self.say("adb 点击失败: %s" % e, "WARN")
+        # pause 是点击后等页面起反应的时间；settle 是再补一段（默认同 pause）。
+        # 任务循环里把 settle 收到 0，省掉一半等待。
+        self.sleep(pause)
+        self.invalidate()
+        if settle is None:
+            settle = pause
+        if settle:
+            self.sleep(settle)
+            self.invalidate()
+
+    def adb_swipe(self, x1, y1, x2, y2, duration=300):
+        """用 adb input swipe 注入滑动（比 Appium swipe 更可靠，不被 ViewPager 拦截）。"""
+        import subprocess
+        _adb = getattr(self, '_adb_path', None)
+        if not _adb:
+            import shutil, os
+            _adb = shutil.which("adb")
+            if not _adb:
+                _adb = os.path.join(os.environ.get("ANDROID_HOME", ""), "platform-tools", "adb.exe")
+                if not os.path.isfile(_adb):
+                    _adb = os.path.join(os.environ.get("ANDROID_SDK_ROOT", ""), "platform-tools", "adb.exe")
+                if not os.path.isfile(_adb):
+                    _adb = "adb"
+            self._adb_path = _adb
+        cmd = [_adb, "shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration)]
+        try:
+            subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except Exception:
+            pass
+
+    def swipe(self, key, pause=1.5):
+        # 金刚区滑动改为动态定位：y 由小图标算出，不再吃 SWIPES 里的固定坐标
+        if key in ("kingkong", "kingkong_back"):
+            return self.swipe_kingkong(
+                "right" if key == "kingkong_back" else "left", pause=pause)
+        (x1, y1), (x2, y2) = SWIPES[key]
+        x1r, y1r = self.sx(x1), self.sy(y1)
+        x2r, y2r = self.sx(x2), self.sy(y2)
+        # 金刚区滑动用 ADB 注入（防外层 ViewPager 拦截）
+        if key == "kingkong":
+            self.adb_swipe(x1r, y1r, x2r, y2r)
+        else:
+            self.d.swipe(x1r, y1r, x2r, y2r, 600)
+        self.sleep(pause)
+        self.invalidate()
+
+    def back(self, pause=2.0):
+        self.d.press_keycode(4)
+        self.sleep(pause)
+        self.invalidate()
+
+    def invalidate(self):
+        """界面已变化，丢弃缓存的 page_source。"""
+        self._xml_cache = None
+        self._xml_ts = 0.0
+
+    def source(self, fresh=False):
+        now = time.time()
+        if (not fresh and self._xml_cache is not None
+                and now - self._xml_ts < self._xml_ttl):
+            return self._xml_cache
+        try:
+            xml = self.d.page_source
+        except Exception as e:
+            self.say("page_source 读取失败: %s" % e, "WARN")
+            return ""
+        self._xml_cache = xml
+        self._xml_ts = time.time()
+        return xml
+
+    @staticmethod
+    def parse_bounds(raw):
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", raw or "")
+        if not m:
+            return None
+        x1, y1, x2, y2 = [int(v) for v in m.groups()]
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
+
+    def nodes(self, xml=None, contains=None):
+        """解析出带有效 bounds 的节点。contains 为可选的 text/content-desc 子串过滤。"""
+        xml = xml if xml is not None else self.source()
+        if not xml:
+            return []
+        try:
+            root = ET.fromstring(xml.encode("utf-8"))
+        except Exception:
+            return []
+        out = []
+        for n in root.iter():
+            t = (n.get("text") or "").strip()
+            desc = (n.get("content-desc") or "").strip()
+            if contains and contains not in t and contains not in desc:
+                continue
+            b = self.parse_bounds(n.get("bounds"))
+            if not b:
+                continue
+            out.append({
+                "text": t,
+                "desc": desc,
+                "bounds": b,
+                "clickable": n.get("clickable") == "true",
+                "class": (n.get("class") or "").rsplit(".", 1)[-1],
+                "res": (n.get("resource-id") or "").strip(),
+            })
+        return out
+
+    def visible(self, node, top=0, bottom_margin=90):
+        x1, y1, x2, y2 = node["bounds"]
+        return (0 <= x1 < x2 <= self.W
+                and top <= y1 < y2 <= self.H - bottom_margin)
+
+    @staticmethod
+    def center(node):
+        x1, y1, x2, y2 = node["bounds"]
+        return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+    # ---------- 金刚区（动态定位，不依赖固定坐标） ----------
+    def kingkong_icons(self, xml=None):
+        """当前页金刚区小图标格子（content-desc + clickable + 有效 bounds）。
+
+        真机实测 2026-11-11（1080x2340）：
+        - 第一页 y=440~601 一行 6 个：秒杀/种豆得豆/家电家居/京喜自营/
+          京东保/东东农场，都是 ViewGroup、clickable=true、高度 ~161px
+        - 左滑后第二页展开成 4 行，【全部频道】在最后一行 [867,924,1080,1085]
+        - 顶部 tab（关注/推荐/国家补贴...）y=331~440 高度仅 109px，
+          靠「格子高度 >= 120」过滤掉，避免把 tab 行误当成金刚区
+        """
+        xml = xml if xml is not None else self.source()
+        if not xml:
+            return []
+        try:
+            root = ET.fromstring(xml.encode("utf-8"))
+        except Exception:
+            return []
+        out = []
+        for n in root.iter():
+            desc = (n.get("content-desc") or "").strip()
+            if not desc or len(desc) > 12:
+                continue
+            if n.get("clickable") != "true" or n.get("displayed") != "true":
+                continue
+            b = self.parse_bounds(n.get("bounds"))
+            if not b:
+                continue
+            x1, y1, x2, y2 = b
+            if not (0 <= x1 < x2 <= self.W and 0 <= y1 < y2 <= self.H):
+                continue
+            if (y2 - y1) < 120:      # 排除顶部 tab 等矮条
+                continue
+            out.append({"desc": desc, "bounds": b, "y1": y1, "y2": y2,
+                        "cy": (y1 + y2) // 2})
+        return out
+
+    def kingkong_row(self, xml=None):
+        """返回金刚区主行 (y_top, y_bottom, icons)；找不到返回 None。
+
+        优先用【秒杀】等锚点小图标定出 y 带；个性化排序把锚点换掉时，
+        退化成「同 y 带格子最多」的结构判据，照样能定位到这一排。
+        """
+        icons = self.kingkong_icons(xml)
+        if not icons:
+            return None
+        anchors = [i for i in icons if i["desc"] in KINGKONG_ANCHOR_DESCS]
+        pool = anchors if anchors else icons
+        bands = []
+        for icon in sorted(pool, key=lambda i: i["y1"]):
+            for band in bands:
+                if abs(band["y1"] - icon["y1"]) <= 40:
+                    band["icons"].append(icon)
+                    band["y1"] = min(band["y1"], icon["y1"])
+                    band["y2"] = max(band["y2"], icon["y2"])
+                    break
+            else:
+                bands.append({"y1": icon["y1"], "y2": icon["y2"], "icons": [icon]})
+        if not bands:
+            return None
+        band = max(bands, key=lambda b: len(b["icons"]))
+        return (band["y1"], band["y2"], band["icons"])
+
+    def swipe_kingkong(self, direction="left", pause=1.5):
+        """在金刚区那一排上横向滑动（y 由小图标动态算出，不用固定坐标）。
+
+        用户实测：金刚区位置常变，必须先找到【秒杀】这类小图标确认
+        "这一排就是金刚区"，再在这一排上左滑，才能翻页找到【全部频道】。
+        """
+        row = self.kingkong_row()
+        if row:
+            y = (row[0] + row[1]) // 2
+            self.say("金刚区行 y=%d~%d（%d 个小图标），在 y=%d 上%s滑" %
+                     (row[0], row[1], len(row[2]), y,
+                      "左" if direction == "left" else "右"))
+        else:
+            y = self.sy(520)
+            self.say("未识别到金刚区小图标，按参考分辨率 y=520 兜底滑动", "WARN")
+        # 短距离 + ADB 注入，防被外层 ViewPager 吃掉切成「秒送」tab
+        if direction == "left":
+            x1, x2 = self.sx(900), self.sx(200)
+        else:
+            x1, x2 = self.sx(200), self.sx(900)
+        self.adb_swipe(x1, y, x2, y, 600)
+        self.sleep(pause)
+        self.invalidate()
+
+    def ensure_kingkong_visible(self, max_swipes=3):
+        """首页被滚下去、金刚区不在视口时，下拉回顶部让小图标重新出现。"""
+        for i in range(max_swipes):
+            self.invalidate()
+            if self.kingkong_row() is not None:
+                return True
+            self.say("金刚区小图标不在视口，下拉页面回顶部（第 %d 次）" % (i + 1),
+                     "WARN")
+            self.adb_swipe(self.sx(540), self.sy(700),
+                           self.sx(540), self.sy(1700), 600)
+            self.sleep(1.2)
+            self.invalidate()
+        return self.kingkong_row() is not None
+
+    def snapshot(self, label="state"):
+        try:
+            folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "debug_shots")
+            if not os.path.isdir(folder):
+                os.makedirs(folder)
+            path = os.path.join(folder, "%s_%s.png" % (label, time.strftime("%H%M%S")))
+            self.d.get_screenshot_as_file(path)
+            self.say("现场截图: %s" % path)
+        except Exception:
+            pass
+
+    # ---------- 页面状态 ----------
+    def page_state(self):
+        """返回 verify / dialog / beans / seckill / channels / home / other。"""
+        xml = self.source()
+        if not xml:
+            return "other"
+        if "京东验证" in xml or "快速验证" in xml:
+            return "verify"
+        # 弹窗特有标志是任务行里的按钮；主页大按钮也叫「做任务解锁刮卡」，不能用。
+        if 'text="去浏览"' in xml or 'text="去刮卡"' in xml:
+            return "dialog"
+        # WebView 根节点带页面标题，是最可靠的页面标识
+        m = re.search(r'<android\.webkit\.WebView[^>]*\btext="([^"]*)"', xml)
+        if m:
+            if m.group(1) == "天天领豆":
+                return "beans"
+            if m.group(1) == "京东秒杀":
+                return "seckill"
+        # 首页特征优先：allowInvisibleElements 会带出缓存的 H5 文本，
+        # 只凭 "全部频道" 字样会把首页误判成频道页。
+        ns = self.nodes(xml)
+        # 【秒杀】小图标是金刚区锚点：只判存在，不再写死 400~700 的 y 范围
+        # （金刚区会随首页改版上下移动，写死范围会漏判首页）
+        if any("已选中" in n["desc"] and "首页" in n["desc"] for n in ns) \
+                or any(n["desc"] == "秒杀" and n["clickable"] for n in ns):
+            return "home"
+        if 'text="全部频道"' in xml:
+            return "channels"
+        return "other"
+
+    # ---------- 公共模块 ----------
+    def restart_to_home(self, wait=6):
+        """冷启动京东，清掉脏状态。
+
+        noReset=True 下 Appium 不会重启 App；若 App 停在「秒送」tab 或首页已
+        滚到推荐流，金刚区不在视口，左滑会被外层 ViewPager 吃掉并切成「秒送」
+        页，导致【全部频道】永远找不到。任务开始前显式 force-stop 再拉起，
+        保证每次都从干净的「首页」tab 顶部开始。
+        """
+        import subprocess
+        import shutil
+        devnull = subprocess.DEVNULL
+        _adb = shutil.which("adb")
+        if not _adb:
+            import os
+            _adb = os.path.join(os.environ.get("ANDROID_HOME", ""), "platform-tools", "adb.exe")
+            if not os.path.isfile(_adb):
+                _adb = os.path.join(os.environ.get("ANDROID_SDK_ROOT", ""), "platform-tools", "adb.exe")
+            if not os.path.isfile(_adb):
+                _adb = "adb"  # 最后的兜底，由系统查找
+        try:
+            subprocess.call([_adb, "shell", "am", "force-stop", self.package],
+                            stdout=devnull, stderr=devnull, timeout=20)
+            subprocess.call([_adb, "shell", "monkey", "-p", self.package,
+                             "-c", "android.intent.category.LAUNCHER", "1"],
+                            stdout=devnull, stderr=devnull, timeout=20)
+        except Exception as e:
+            self.say("冷启动京东失败: %s" % e, "WARN")
+        self.sleep(wait)
+        self.invalidate()
+        self._select_home_tab()
+        return self.page_state() == "home"
+
+    def _select_home_tab(self):
+        """京东冷启动后可能停在「秒送/特价/新品」tab，先切回顶部「首页」tab。"""
+        ns = self.nodes()
+        if any("已选中" in n["desc"] and "首页" in n["desc"] for n in ns):
+            return True
+        cands = [n for n in ns if n["text"] == "首页" and n["bounds"][1] < 300]
+        if not cands:
+            return False
+        self.say("切换到顶部【首页】tab")
+        self.tap(self.center(cands[0]), pause=2)
+        return True
+
+    def goto_home(self, max_back=10):
+        self._select_home_tab()
+        if self.page_state() == "home":
+            return True
+        for _ in range(max_back):
+            self.back(1.2)
+            self._select_home_tab()
+            if self.page_state() == "home":
+                return True
+        # 兜底：adb 冷启动京东到首页（Appium 3 下 start_activity 可能不可用）
+        try:
+            import subprocess
+            import shutil
+            _adb2 = shutil.which("adb")
+            if not _adb2:
+                import os
+                _adb2 = os.path.join(os.environ.get("ANDROID_HOME", ""), "platform-tools", "adb.exe")
+                if not os.path.isfile(_adb2):
+                    _adb2 = os.path.join(os.environ.get("ANDROID_SDK_ROOT", ""), "platform-tools", "adb.exe")
+                if not os.path.isfile(_adb2):
+                    _adb2 = "adb"
+            subprocess.call([_adb2, "shell", "am", "force-stop", self.package],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.call([_adb2, "shell", "monkey", "-p", self.package,
+                             "-c", "android.intent.category.LAUNCHER", "1"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        self.sleep(5)
+        self._select_home_tab()
+        return self.page_state() == "home"
+
+    def to_all_channels(self):
+        """公共模块：首页 -> 金刚区第二页 -> 【全部频道】列表。"""
+        if not self._restarted:
+            self._restarted = True
+            self.say("【公共模块】冷启动京东，确保从干净首页开始")
+            if not self.restart_to_home():
+                self.say("冷启动后未识别到首页，继续尝试原回退流程", "WARN")
+        self.say("【公共模块】确认在京东首页")
+        if not self.goto_home():
+            raise RuntimeError("无法回到京东首页，请检查 App 是否在前台")
+        self.say("【公共模块】用金刚区小图标（如【秒杀】）定位滑动行")
+        if not self.ensure_kingkong_visible():
+            raise RuntimeError("首页未找到金刚区小图标，无法滑动找【全部频道】")
+
+        def find_target():
+            # 只认金刚区里可点击的 desc="全部频道" 格子，排除 H5 缓存的文本节点
+            return [n for n in self.nodes(contains="全部频道")
+                    if self.visible(n) and n["clickable"] and n["desc"] == "全部频道"]
+
+        # 【全部频道】不在金刚区第一页，必须左滑把它翻出来再按节点点，
+        # 不能拿标定坐标盲点（用户 2026-11-11 明确要求）。
+        target = find_target()
+        swipes = 0
+        while not target and swipes < MAX_KINGKONG_SWIPES:
+            self.say("【公共模块】第 %d 次左滑金刚区找【全部频道】" % (swipes + 1))
+            self.swipe_kingkong("left", pause=2)
+            swipes += 1
+            target = find_target()
+        if not target:
+            raise RuntimeError(
+                "左滑金刚区 %d 次仍未找到【全部频道】节点，请查看 debug_shots" % swipes)
+
+        node = sorted(target, key=lambda n: n["bounds"][1])[0]
+        self.say("【公共模块】命中【全部频道】%s（左滑 %d 次）" %
+                 (node["bounds"], swipes))
+        self.tap(self.center(node), pause=3)
+        # 必须真验到 channels 才敢说进去了：旧实现无论落到哪一页都打「已进入」，
+        # 实测曾停在【我的关注】却报成功，后面整条坐标链路全崩（假绿灯）。
+        if not self.wait_page_state("channels", timeout=8):
+            raise RuntimeError(
+                "点了【全部频道】但未进入频道页（当前 state=%s），请查看 debug_shots"
+                % self.page_state())
+        self.say("【公共模块】已进入【全部频道】列表")
+        return True
+
+    # ---------- 任务1 导航 ----------
+    def _stable_kingkong_icon(self, desc, tries=4):
+        """取 desc 图标的 bounds，要求连续两次 dump 一致才认为可点。
+
+        冷启动后首页还在回弹：实测第一次 dump 到 (0,560,194,721)，真正点下去时
+        已经回到 (0,440,194,601)，中心 (97,640) 正好落在两行之间的空隙，点了没反应。
+        返回 (icon, stable)；本页没有该图标时返回 (None, False)。
+        """
+        last = None
+        for i in range(tries):
+            icons = [n for n in self.kingkong_icons() if n["desc"] == desc]
+            cur = sorted(icons, key=lambda n: n["cy"])[0] if icons else None
+            if cur is not None and last is not None and cur["bounds"] == last["bounds"]:
+                return cur, True
+            last = cur
+            if i < tries - 1:
+                self.sleep(0.8)
+                self.invalidate()
+        return last, False
+
+    def tap_kingkong(self, desc, pause=3.0):
+        """点首页金刚区里 desc 对应的小图标；点到返回 True。
+
+        金刚区是原生节点（content-desc + clickable + bounds），比 H5 坐标链路可靠。
+        实测 2026-11-12：desc='秒杀' bounds=(0,440,194,601)，点击后 2 秒进秒杀页。
+        坐标必须等行位置稳定后再算（见 _stable_kingkong_icon），否则会点到空隙。
+        当前页找不到就左右各滑一次，兼容金刚区翻页。
+        """
+        for attempt in range(3):
+            icon, stable = self._stable_kingkong_icon(desc)
+            if icon is not None:
+                if not stable:
+                    self.say("金刚区【%s】位置连续 dump 不一致，按最后一次 %s 尝试点击" %
+                             (desc, icon["bounds"]), "WARN")
+                x1, y1, x2, y2 = icon["bounds"]
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                self.say("金刚区命中【%s】%s，点击 (%d,%d)" %
+                         (desc, icon["bounds"], cx, cy))
+                self.tap((cx, cy), pause=pause)
+                return True
+            if attempt < 2:
+                direction = "left" if attempt == 0 else "right"
+                self.say("金刚区当前页未见【%s】，向%s滑一次" %
+                         (desc, "左" if direction == "left" else "右"), "WARN")
+                self.swipe_kingkong(direction, pause=1.5)
+        return False
+
+    def wait_page_state(self, target, timeout=10.0):
+        """轮询页面状态直到等于 target 或超时。
+
+        H5 页渲染慢：点完立刻判状态会把「已成功但还没渲染」误判成失败，
+        2026-11-12 实测秒杀页从点击到 page_state 变 seckill 约需 3~6 秒。
+        """
+        deadline = time.time() + timeout
+        while True:
+            if self.page_state() == target:
+                return True
+            if time.time() >= deadline:
+                return False
+            self.sleep(1.0)
+            self.invalidate()
+
+    def to_seckill_page(self, retries=3):
+        """进入【京东秒杀】页。
+
+        路线 A（首选）：首页金刚区【秒杀】原生节点 —— 一次点击，随首页改版自动跟随。
+        路线 B（兜底）：【全部频道】-【优惠权益】-【秒杀】坐标链路。
+
+        旧实现只有路线 B 且坐标全部过期，真机上必然失败：
+        coupon_tab 的 y=765 落在便民服务网格里，seckill 的 x=153 已是【京补合约】。
+        """
+        for i in range(retries):
+            if self.page_state() == "seckill":
+                self.say("已在【京东秒杀】页")
+                return True
+
+            # 路线 A：金刚区直达。先在首页连点 2 次 —— 金刚区偶发一次点不中，
+            # 重试一次只要几秒；而绕【全部频道】单趟就要 60 秒以上（实测整条 100.8s 才成功）。
+            for a in range(2):
+                if not self.goto_home():
+                    break
+                if not self.tap_kingkong("秒杀"):
+                    break
+                if self.wait_page_state("seckill", timeout=12):
+                    self.say("已进入【京东秒杀】页（金刚区直达）")
+                    return True
+                self.say("第 %d 次点金刚区【秒杀】未到秒杀页" % (a + 1), "WARN")
+
+            # 路线 B：全部频道 -> 优惠权益 -> 秒杀。坐标链路脆弱，只在最后一轮兜底。
+            if i == retries - 1:
+                try:
+                    self.to_all_channels()
+                    self.tap("coupon_tab", pause=2)
+                    self.tap("seckill", pause=3)
+                    if self.wait_page_state("seckill", timeout=12):
+                        self.say("已进入【京东秒杀】页（全部频道-优惠权益）")
+                        return True
+                except Exception as e:
+                    self.say("走【全部频道】进秒杀失败：%s" % e, "WARN")
+
+            self.say("第 %d 次进入【京东秒杀】页失败，重试" % (i + 1), "WARN")
+
+        raise RuntimeError(
+            "未进入【京东秒杀】页（金刚区与全部频道两条路线都失败），"
+            "请查看 debug_shots 校准坐标")
+
+    def to_beans_page(self, retries=4):
+        """点【赚更多京豆】进天天领豆。
+
+        H5 坐标点击偶发被吞（adb 成功但页面不响应），所以和【全部任务】
+        一样做「点击 -> 轮询页面状态 -> 再点」的应用层重试。
+        """
+        for i in range(retries):
+            if self.page_state() == "beans":
+                break
+            if i:
+                self.say("第 %d 次点击【赚更多京豆】" % (i + 1), "WARN")
+            self.tap("earn_beans", pause=2.5)
+            for _ in range(3):
+                if self.page_state() == "beans":
+                    break
+                self.sleep(1.5)
+            if self.page_state() == "beans":
+                break
+        if self.page_state() != "beans":
+            raise RuntimeError("未进入【天天领豆】页，请查看 debug_shots 校准坐标")
+        # 刚跳进来时京豆数字在做滚动动画，此时点击会被吞掉
+        self.sleep(2.5)
+        self.say("已进入【秒杀 x 天天刮京豆 / 天天领豆】页（页面已稳定）")
+        return True
+
+    def open_task_dialog(self, retries=6):
+        """点【全部任务】可能被页面动画吞掉，Appium tap / adb tap 交替重试。"""
+        for i in range(retries):
+            if self.page_state() == "dialog":
+                return True
+            self.say("点击【全部任务】（第 %d 次）" % (i + 1))
+            if i % 2 == 0:
+                self.tap("all_tasks", pause=3)
+            else:
+                self.adb_tap("all_tasks", pause=3)
+            if self.page_state() == "dialog":
+                return True
+            self.sleep(2)
+        return self.page_state() == "dialog"
+
+    def ensure_task_dialog(self, max_attempts=6):
+        """浏览返回后可能落在弹窗 / 天天领豆 / 秒杀页，统一收敛到任务弹窗。"""
+        for _ in range(max_attempts):
+            state = self.page_state()
+            if state == "dialog":
+                return True
+            if state == "verify":
+                self.handle_verify()
+            elif state == "beans":
+                self.say("任务弹窗已关闭，重新点击【全部任务】")
+                self.open_task_dialog()
+            elif state == "seckill":
+                self.say("返回落在秒杀页，重新进入【赚更多京豆】")
+                self.to_beans_page()
+                self.open_task_dialog()
+            elif state == "home":
+                self.to_all_channels()
+                self.to_seckill_page()
+                self.to_beans_page()
+                self.open_task_dialog()
+            else:
+                self.back(1.5)
+        return self.page_state() == "dialog"
+
+    def handle_verify(self):
+        self.say("检测到【京东验证】风控页，尝试【快速验证】", "WARN")
+        btn = [n for n in self.nodes(contains="快速验证") if self.visible(n) and n["clickable"]]
+        if btn:
+            self.tap(self.center(btn[0]), pause=3)
+        else:
+            self.tap("quick_verify", pause=3)
+        if self.page_state() == "verify":
+            self.say("自动验证未通过，可能需要你手动完成验证（短信/滑块）", "WARN")
+            return False
+        return True
+
+    # ---------- 任务列表 ----------
+    def browse_buttons(self):
+        """当前屏幕内可见的【去浏览】按钮，按从上到下排序。"""
+        ns = self.nodes()
+        btns = [n for n in ns
+                if n["text"] == "去浏览" and n["clickable"] and self.visible(n, top=200)]
+        return sorted(btns, key=lambda n: n["bounds"][1])
+
+    def task_key(self, button, all_nodes):
+        """取按钮左侧同一行的任务标题（去掉进度）作为去重键。"""
+        x1, y1 = button["bounds"][0], button["bounds"][1]
+        cands = [n for n in all_nodes
+                 if n["text"] and n["bounds"][0] < x1 - 100
+                 and abs(n["bounds"][1] - y1) < 70]
+        if not cands:
+            return "y_%d" % y1
+        title = sorted(cands, key=lambda n: n["bounds"][1])[0]["text"]
+        return re.sub(r"\s*[（(]\s*\d+\s*/\s*\d+\s*[)）]\s*", "", title).strip()
+
+    # ---------- 刮卡 ----------
+    def scratch_buttons(self):
+        """任务弹窗中当前可见的【去刮卡】按钮，按从上到下排序。"""
+        btns = [n for n in self.nodes()
+                if n["text"] == "去刮卡" and n["clickable"] and self.visible(n, top=200)]
+        return sorted(btns, key=lambda n: n["bounds"][1])
+
+    def first_scratch_button(self, max_swipes=3):
+        """优先点当前屏第一条【去刮卡】；没有就边回滚边找，找到即返回。"""
+        btns = self.scratch_buttons()
+        if btns:
+            return btns[0]
+        for _ in range(3):
+            self.swipe("task_list_down", pause=0.4)
+            btns = self.scratch_buttons()
+            if btns:
+                return btns[0]
+        for i in range(max_swipes):
+            btns = self.scratch_buttons()
+            if btns:
+                return btns[0]
+            if i < max_swipes - 1:
+                self.swipe("task_list", pause=0.8)
+        return None
+
+    def scratch_now_button(self):
+        """天天领豆主页中间的【立即刮卡】大按钮。"""
+        for n in self.nodes(contains="立即刮卡"):
+            if n["text"] == "立即刮卡" and n["clickable"] and self.visible(n):
+                return n
+        return None
+
+    def bean_balance(self):
+        """读取页面上的「可抵 XX 元」，用于确认刮卡到账。"""
+        for n in self.nodes():
+            m = re.search(r"可抵\s*([0-9.]+)\s*元", n["text"])
+            if m:
+                return m.group(1)
+        return None
+
+    def wait_scratch_done(self, timeout=20):
+        """等待刮卡结束：主页按钮从【立即刮卡】变回【做任务解锁刮卡】。"""
+        def settled():
+            return any("做任务解锁刮卡" in n["text"] for n in self.nodes())
+
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.stop is not None and self.stop.is_set():
+                return False
+            if settled():
+                return True
+            time.sleep(1)
+        return settled()
+
+    # ---------- 多轮刮卡 ----------
+    def unlock_button(self):
+        """天天领豆主页的【做任务解锁刮卡】按钮。
+
+        弹窗里也可能出现同名文本，先排除 dialog 状态，避免误判。
+        """
+        if self.page_state() == "dialog":
+            return None
+        for n in self.nodes():
+            if n["text"] == "做任务解锁刮卡" and n["clickable"] and self.visible(n):
+                return n
+        return None
+
+    def swipe_task_cards(self, pause=1.2):
+        """横向左滑【任务卡】轮播，切到下一张卡。"""
+        self.swipe("task_cards", pause=pause)
+
+    def wait_balance_change(self, before, timeout=10):
+        """刮卡到账判据：可抵金额发生变化，返回新金额；超时返回 None。
+
+        实测（2026-11-10）：刮完一张后主按钮可能仍是【立即刮卡】——页面自动
+        切到下一张待刮卡，并不会变回【做任务解锁刮卡】。所以旧版
+        wait_scratch_done() 的判据在多卡场景下必然超时，改用余额变化最可靠。
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.stop is not None and self.stop.is_set():
+                return None
+            self.invalidate()  # 轮询必须取新页面，不能吃缓存
+            cur = self.bean_balance()
+            if cur is not None and cur != before:
+                return cur
+            time.sleep(1)
+        return None
+
+    def ensure_beans_page(self, max_attempts=6):
+        """把当前页面收敛回【天天领豆】。"""
+        for _ in range(max_attempts):
+            state = self.page_state()
+            if state == "beans":
+                self.sleep(1.5)  # 等京豆数字滚动动画结束
+                return True
+            if state == "verify":
+                self.handle_verify()
+            elif state == "seckill":
+                self.to_beans_page()
+            elif state == "channels":
+                self.to_seckill_page()
+                self.to_beans_page()
+            elif state == "home":
+                self.to_all_channels()
+                self.to_seckill_page()
+                self.to_beans_page()
+            else:
+                self.back(1.5)
+        return self.page_state() == "beans"
+
+    def refresh_beans_page(self):
+        """刷新【天天领豆】：退回上一页再重进，让服务端重算刮卡机会。"""
+        self.say("刷新【天天领豆】页面")
+        self.back(2)
+        if self.page_state() == "beans":
+            # back 被页面吞掉时，用下拉刷新兜底
+            self.say("返回未生效，改用下拉刷新", "WARN")
+            self.d.swipe(self.sx(540), self.sy(500), self.sx(540), self.sy(1600), 800)
+            self.sleep(3)
+            self.invalidate()
+        return self.ensure_beans_page()

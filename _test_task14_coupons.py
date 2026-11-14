@@ -1,0 +1,1239 @@
+# -*- coding: utf-8 -*-
+"""任务14【领券中心·天天领豆】离线回归（不连手机、不连 Appium、不加载 PaddleOCR）。
+
+覆盖：
+  A. 模块元信息 / 需求常量 / 源码合规 / 平台动态发现
+  B. dwell_seconds 随机 12~15、基础工具函数
+  C. classify 真机夹具页面判定（首页/特价/浮层/领券中心/盲帧/弹窗/落地页/风控）
+  D. in_list / is_button 安全区与按钮白名单（含 clickable=false 的 TextView）
+  E. reward_of / row_title 同行配对（排除抽奖任务、价格文案、隔行错配）
+  F. parse_rows 逐屏精确断言（可做任务 = 完成得Y京豆 + 白名单按钮）
+  G. OCR 兜底通道（真机 OCR 夹具）与 XML 通道结果一致性
+  H. panel_sig / ocr_sig 到底判界
+  I. task_key 去进度 / pick_target 台账
+  J. 模块方法：入口定位、浮层关闭、盲帧 OCR、状态机恢复
+  K. SimUI 跑完整 run()：正常/浮层/盲帧OCR/补位上限/风控/back丢失/停止/空任务
+  L. 需求合规：只做京豆任务、9~10s 随机、一次 back、循环到无可做任务
+  M. v2 提速：截图 OCR 主通道、面板不在树也每帧可判、进度驱动做到 M/M
+
+真机夹具（2026-11-13 抓）：
+  _fixture_coupon_home.xml / _fixture_coupon_tejia.xml
+  _fixture_coupon_float.xml / _fixture_coupon_center.xml
+  _fixture_coupon_panel_no_nodes.xml   （截图有弹窗、XML 无弹窗节点的盲帧）
+  _fixture_coupon_panel.xml / _panel_scroll.xml / _panel_s4.xml / _after_back.xml
+  _fixture_coupon_landing.xml
+  _fixture_coupon_ocr.json             （PaddleOCR 离线结果，避免测试加载模型）
+"""
+import io
+import json
+import re
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+
+sys.path.insert(0, ".")
+
+import modules.task14_coupons as MOD
+from modules.task14_coupons import (
+    Task14Coupons, classify, norm, valid, center, in_list, is_button,
+    reward_of, row_title, task_key, parse_rows, parse_ocr_rows,
+    ocr_panel_visible, panel_sig, ocr_sig, dwell_seconds, pick_target,
+    PANEL_MARK, ENTRY_TEXTS, BTN_TEXTS, ALL_BTN_TEXTS, VERIFY_MARKS,
+    LANDING_MARKS,
+    FLOAT_MARKS, SAFE_TOP, SAFE_BOTTOM, BTN_MIN_X, BTN_MAX_X,
+    LEFT_MIN_X, LEFT_MAX_X, DWELL_MIN, DWELL_MAX,
+    SWIPE_UP, SWIPE_DOWN, FLOAT_CLOSE_XY, OCR_CROP_TOP,
+    OCR_BOX, OCR_SCALE, OCR_TITLE_BOX, OCR_TITLE_SCALE,
+    DWELL_CAP, DWELL_BONUS_MAX, DWELL_BONUS_STEP,
+    PROGRESS_RE, REWARD_RE, PRICE_RE,
+    MAX_TASKS, MAX_SCROLLS, MAX_PER_TASK, MAX_PASSES, MAX_PER_SCREEN,
+    MAX_RETRY, MAX_TO_TOP, MAX_ENTER_STEPS, MAX_PROGRESS_EXTRA,
+    MAX_OPEN_STEPS, MAX_OCR, MAX_PER_TASK_PROGRESS,
+    progress_total, progress_current, task_limit,
+)
+
+PASSED = []
+FAILED = []
+
+
+def check(name, cond, detail=""):
+    if cond:
+        PASSED.append(name)
+        print("PASS %s" % name)
+    else:
+        FAILED.append(name)
+        print("FAIL %s   %s" % (name, detail))
+
+
+# ---------------------------------------------------------------- 夹具工具
+_BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+
+def load(path):
+    """解析成 jd_ui.nodes() 同样的结构（退化 bounds 直接丢掉）。"""
+    s = io.open(path, encoding="utf-8", errors="replace").read()
+    root = ET.fromstring(s.encode("utf-8"))
+    out = []
+    for n in root.iter():
+        m = _BOUNDS_RE.match(n.get("bounds") or "")
+        if not m:
+            continue
+        b = tuple(int(x) for x in m.groups())
+        if b[2] <= b[0] or b[3] <= b[1]:
+            continue
+        out.append({
+            "text": (n.get("text") or "").strip(),
+            "desc": (n.get("content-desc") or "").strip(),
+            "bounds": b,
+            "clickable": n.get("clickable") == "true",
+            "class": (n.get("class") or "").rsplit(".", 1)[-1],
+            "res": (n.get("resource-id") or "").strip(),
+        })
+    return out
+
+
+def nd(text, x1, y1, x2, y2, clickable=False, desc="", cls="TextView"):
+    return {"text": text, "desc": desc, "bounds": (x1, y1, x2, y2),
+            "clickable": clickable, "class": cls}
+
+
+def ctr(b):
+    return ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+
+
+HOME = load("_fixture_coupon_home.xml")
+TEJIA = load("_fixture_coupon_tejia.xml")
+FLOAT = load("_fixture_coupon_float.xml")
+CENTER = load("_fixture_coupon_center.xml")
+CENTER2 = load("_fixture_coupon_center2.xml")   # 2026-11-14 新布局
+NO_NODES = load("_fixture_coupon_panel_no_nodes.xml")
+PANEL = load("_fixture_coupon_panel.xml")
+PANEL_SCROLL = load("_fixture_coupon_panel_scroll.xml")
+PANEL_S4 = load("_fixture_coupon_panel_s4.xml")
+AFTER_BACK = load("_fixture_coupon_after_back.xml")
+LANDING = load("_fixture_coupon_landing.xml")
+OCR = json.load(io.open("_fixture_coupon_ocr.json", encoding="utf-8"))
+SRC = io.open("modules/task14_coupons.py", encoding="utf-8").read()
+
+VERIFY = [nd(u"京东验证", 100, 300, 900, 400),
+          nd(u"快速验证", 100, 500, 900, 600)]
+
+TOP_TAB = (17, 99, 167, 226)               # 顶部一级 tab【特价】
+COUPON_TAB_BOX = (808, 342, 1004, 530)     # 二级 tab【领券中心】可点父容器
+ENTRY_BTN = (22, 821, 225, 1113)           # 【天天领豆-领更多】整卡 Button
+ENTRY_PT = (123, 1065)                     # 卡片下缘【领更多】
+
+
+# ================================================================ A
+print("\n--- A. 元信息 / 常量 / 源码合规 / 平台发现 ---")
+check("A1 模块名", Task14Coupons.name == u"领券中心·天天领豆")
+check("A2 图标是彩色 emoji（不是汉字）",
+      Task14Coupons.icon == u"\U0001F3AB" and
+      Task14Coupons.icon not in (u"券", u"豆", u"领"),
+      "%r" % Task14Coupons.icon)
+check("A3 描述含【特价】", u"特价" in Task14Coupons.description)
+check("A4 描述含【领券中心】", u"领券中心" in Task14Coupons.description)
+check("A5 描述含【领更多】", u"领更多" in Task14Coupons.description)
+check("A6 描述含【完成得Y京豆】", u"完成得Y京豆" in Task14Coupons.description)
+check("A7 描述含 9~10 秒", u"9~10" in Task14Coupons.description)
+check("A8 按钮白名单严格三项",
+      BTN_TEXTS == (u"去浏览", u"逛一逛", u"去完成"))
+check("A9 白名单不含完成态", u"已完成" not in BTN_TEXTS and
+      u"已完成" in ALL_BTN_TEXTS)
+check("A10 入口文案覆盖新旧两版（更多任务/领更多/天天领豆 + 立即领奖）",
+      set([u"更多任务", u"领更多", u"天天领豆"]).issubset(set(ENTRY_TEXTS))
+      and u"立即领奖" in ENTRY_TEXTS and u"coupon-left-entry" in MOD.ENTRY_RES)
+check("A11 弹窗标题标记", PANEL_MARK == u"做任务得奖励")
+check("A12 风控标记", u"京东验证" in VERIFY_MARKS and
+      u"快速验证" in VERIFY_MARKS)
+check("A13 浮层标记", u"满30元可用" in FLOAT_MARKS and
+      u"整点再来" in FLOAT_MARKS)
+check("A14 任务可视安全区", (SAFE_TOP, SAFE_BOTTOM) == (1050, 2168))
+check("A15 按钮贴右区间", (BTN_MIN_X, BTN_MAX_X) == (800, 1060))
+check("A16 左对齐区间", (LEFT_MIN_X, LEFT_MAX_X) == (170, 330))
+check("A17 停留 9~10s（提速后按需求压到 9 秒）",
+      (DWELL_MIN, DWELL_MAX) == (9, 10))
+check("A18 短滑动（不能滚掉弹窗）",
+      SWIPE_UP == (540, 1600, 540, 1100) and
+      SWIPE_DOWN == (540, 1100, 540, 1600))
+check("A19 浮层 X 参考坐标", FLOAT_CLOSE_XY == (540, 2050))
+check("A20 OCR 裁掉弹窗以上区域", OCR_CROP_TOP == 840)
+check("A20b 面板区裁剪 + 0.45 降采样（提速主力，模型预热后 ≈0.6s）",
+      OCR_BOX == (0, 860, 1080, 2180) and OCR_SCALE == 0.45)
+check("A20d 裁剪区必须包含弹窗标题（裁太高会认不出【做任务得奖励】）",
+      OCR_BOX[1] <= 900)
+check("A20c 只判面板在场时用更小的标题条（≈1s，替代 dump）",
+      OCR_TITLE_BOX[1] <= 900 and OCR_TITLE_BOX[2] <= 700 and
+      OCR_TITLE_BOX[3] - OCR_TITLE_BOX[1] <= 200 and
+      OCR_TITLE_SCALE >= OCR_SCALE,
+      "%s x%.2f" % (OCR_TITLE_BOX, OCR_TITLE_SCALE))
+check("A21 多重上限保护齐全",
+      (MAX_TASKS, MAX_PASSES, MAX_PER_SCREEN, MAX_SCROLLS, MAX_PER_TASK,
+       MAX_RETRY, MAX_TO_TOP, MAX_ENTER_STEPS,
+       MAX_OPEN_STEPS, MAX_OCR) ==
+      (40, 8, 30, 12, 3, 2, 5, 14, 12, 400),
+      "%s" % ((MAX_TASKS, MAX_PASSES, MAX_PER_SCREEN, MAX_SCROLLS,
+               MAX_PER_TASK, MAX_RETRY, MAX_TO_TOP, MAX_ENTER_STEPS,
+               MAX_OPEN_STEPS, MAX_OCR),))
+check("A21b 停留自适应上限（进度不涨才加时）",
+      (DWELL_CAP, DWELL_BONUS_MAX, DWELL_BONUS_STEP) == (15, 6, 3))
+check("A21c 进度漏涨容忍次数", MAX_PROGRESS_EXTRA == 2)
+check("A22 正则命中两种京豆奖励文案",
+      bool(REWARD_RE.search(u"浏览完成得2京豆")) and
+      bool(REWARD_RE.search(u"完成得2京豆")) and
+      bool(REWARD_RE.search(u"浏览完成得2京豆8+1")))
+check("A23 正则排除抽奖/超低价文案",
+      not REWARD_RE.search(u"完成任务获得抽奖机会") and
+      not REWARD_RE.search(u"浏览6S获得抽奖机会") and
+      not REWARD_RE.search(u"享券后超低价"))
+check("A24 进度正则命中中英文括号",
+      bool(PROGRESS_RE.search(u"逛活动页面领京豆(1/5)")) and
+      bool(PROGRESS_RE.search(u"浏览页面得京豆（0/5)")) and
+      not PROGRESS_RE.search(u"¥269.00"))
+check("A25 价格排除正则", bool(PRICE_RE.search(u"¥269.00")) and
+      bool(PRICE_RE.search(u"到手价")) and
+      not PRICE_RE.search(u"逛活动页面领京豆"))
+
+_FORBIDDEN = ("send_keys", "mobile: type", "unicodeKeyboard", "By.ID",
+              "By.CLASS_NAME", "find_element", "switch_to",
+              "-android uiautomator", "adb shell input text",
+              "set_clipboard", "XPath", "xpath")
+for i, tok in enumerate(_FORBIDDEN, 1):
+    check("A26.%d 源码无 %s" % (i, tok), tok not in SRC)
+check("A27 OCR 是懒加载（模块顶层不 import paddleocr）",
+      "from modules.task5_joy_trip import ocr_items" in SRC and
+      SRC.find("from modules.task5_joy_trip import ocr_items") >
+      SRC.find("def _ocr_items") and
+      "paddleocr" not in SRC.split("def _ocr_items")[0])
+check("A28 源码有随机停留", "randint" in SRC and "dwell_seconds" in SRC)
+check("A29 源码有进度归一化台账", "task_key" in SRC and "attempts" in SRC)
+check("A30 源码有 stop_event 中断", "_stopped" in SRC and "stop_event" in SRC)
+check("A31 源码有 log.done", "log.done" in SRC)
+check("A32 源码无领奖流程（需求没要求，ALL_BTN_TEXTS 里的文案只是签名用）",
+      u"开心收下" not in SRC and "_claim_all" not in SRC and
+      "_clear_reward" not in SRC)
+check("A33 源码有关键方法",
+      all(k in SRC for k in ("_probe", "_reach_center", "_open_panel",
+                             "_clear_float", "_do_one", "_do_tasks")))
+import modules as _mods
+_NAMES = [m.name for m in _mods.get_modules()]
+check("A34 平台动态发现到 task14", Task14Coupons.name in _NAMES,
+      "%s" % (_NAMES,))
+check("A35 平台所有卡片图标都不是纯汉字",
+      not any(m.icon in (u"补", u"礼", u"女", u"水滴", u"券", u"豆")
+              for m in _mods.get_modules()))
+
+
+# ================================================================ B
+print("\n--- B. dwell_seconds / 基础工具 ---")
+
+
+class FixedRnd(object):
+    def __init__(self, v):
+        self.v = v
+
+    def randint(self, a, b):
+        self.args = (a, b)
+        return self.v
+
+
+for v in (9, 10):
+    r = FixedRnd(v)
+    check("B%d 固定 %d 返回 %d" % (v - 8, v, v),
+          dwell_seconds(r) == v and r.args == (9, 10))
+samples = [dwell_seconds() for _ in range(400)]
+check("B5 全部落在 9~10", all(9 <= x <= 10 for x in samples))
+check("B6 两个取值都出现过（不是常量）", set(samples) == set([9, 10]),
+      "%s" % (sorted(set(samples)),))
+check("B7 norm 压空白/换行",
+      norm(u" 做任务 得奖励\n ") == u"做任务得奖励")
+check("B8 valid 正确", valid((1, 2, 3, 4)) and not valid((1, 2, 3, 2))
+      and not valid(None) and not valid((1, 2, 3)))
+check("B9 center 取整", center((855, 1115, 970, 1176)) == (912, 1145))
+check("B10 REWARD_RE 提取京豆数",
+      REWARD_RE.search(u"浏览完成得12京豆").group(1) == "12")
+
+
+# ================================================================ C
+print("\n--- C. classify 真机页面判定 ---")
+check("C1 首页 -> home", classify(HOME) == "home", classify(HOME))
+check("C2 特价页 -> tejia", classify(TEJIA) == "tejia", classify(TEJIA))
+check("C3 恭喜获得浮层 -> float", classify(FLOAT) == "float", classify(FLOAT))
+check("C4 领券中心底页 -> center", classify(CENTER) == "center",
+      classify(CENTER))
+check("C5 XML 无弹窗节点的盲帧仍判 center（靠 OCR 兜底）",
+      classify(NO_NODES) == "center", classify(NO_NODES))
+check("C6 任务弹窗 -> panel", classify(PANEL) == "panel", classify(PANEL))
+check("C7 弹窗滚动帧 -> panel", classify(PANEL_SCROLL) == "panel")
+check("C8 弹窗第 4 屏 -> panel", classify(PANEL_S4) == "panel")
+check("C9 浏览后 back 回来 -> panel", classify(AFTER_BACK) == "panel")
+check("C10 商品落地页 -> landing", classify(LANDING) == "landing",
+      classify(LANDING))
+check("C11 风控页 -> verify", classify(VERIFY) == "verify")
+check("C12 空节点 -> other", classify([]) == "other")
+check("C13 弹窗优先级高于 center（两页节点混叠）",
+      classify(PANEL + CENTER) == "panel")
+# 风控页叠在弹窗之上时也要先判 verify
+check("C14 verify 优先级最高", classify(PANEL + VERIFY) == "verify")
+# 浮层必须靠独有文案判断，不能靠「关闭浮层活动」这个常驻退化节点
+check("C16 落地页优先级高于 center（H5 换页残留标题）",
+      classify(LANDING + CENTER) == "landing")
+check("C17 落地页标记不能用「到手价」（底页也有）",
+      u"到手价" not in LANDING_MARKS)
+check("C18 落地页标记四条都在",
+      set(LANDING_MARKS) == set([u"条评价", u"好评率", u"继续浏览",
+                                 u"好物清单"]))
+check("C15 单看常驻节点不会误判浮层",
+      classify([nd(u"领券中心", 0, 530, 1080, 2340, cls="WebView"),
+                nd(u"", 1080, 337, 1068, 314, desc=u"关闭浮层活动")]) ==
+      "center")
+
+
+# ================================================================ D
+print("\n--- D. in_list / is_button 安全区与白名单 ---")
+OK_B = (855, 1115, 970, 1176)
+check("D1 首行按钮在可视区", in_list(OK_B))
+check("D2 弹窗顶部裁掉的行 y=926 被排除",
+      not in_list((855, 926, 970, 987)))
+check("D3 背景页 y=532/728 被排除",
+      not in_list((855, 532, 970, 593)) and
+      not in_list((855, 728, 970, 789)))
+check("D4 底栏遮挡的 y=2292 被排除",
+      not in_list((855, 2292, 970, 2340)))
+check("D5 x1 < 800 被排除", not in_list((700, 1115, 970, 1176)))
+check("D6 x2 > 1060 被排除", not in_list((855, 1115, 1070, 1176)))
+check("D7 退化 bounds 被排除",
+      not in_list((855, 1115, 970, 1115)) and not in_list(None))
+check("D8 边界值 y1=1050 / y2=2168 仍可用",
+      in_list((855, 1050, 970, 1111)) and
+      in_list((855, 2107, 970, 2168)))
+for i, t in enumerate(BTN_TEXTS, 1):
+    check("D9.%d 白名单按钮 %s 命中" % (i, t),
+          is_button(nd(t, OK_B[0], OK_B[1], OK_B[2], OK_B[3])))
+check("D10 XML 里 clickable=false 的 TextView 也算按钮",
+      is_button(nd(u"去完成", 855, 1115, 970, 1176,
+                   clickable=False, cls="TextView")))
+check("D11 非白名单按钮排除",
+      not is_button(nd(u"已完成", 855, 1115, 970, 1176)) and
+      not is_button(nd(u"去抽奖", 855, 1115, 970, 1176)) and
+      not is_button(nd(u"立即使用", 855, 1115, 970, 1176)))
+check("D12 落地页的【去完成】不因坐标误入（页面未判 panel）",
+      parse_rows([nd(u"去完成", 907, 1867, 1042, 1936)]) == [])
+check("D13 is_button 不误收弹窗头部【我的奖励】",
+      not is_button(nd(u"我的奖励", 420, 959, 629, 1000, clickable=True)))
+
+
+# ================================================================ E
+print("\n--- E. reward_of / row_title 同行配对 ---")
+check("E1 京豆行取到 2 京豆",
+      reward_of(PANEL, (855, 1704, 970, 1764)) == (2, u"浏览完成得2京豆"),
+      "%s" % (reward_of(PANEL, (855, 1704, 970, 1764)),))
+check("E2 京豆行取到正确标题",
+      row_title(PANEL, (855, 1704, 970, 1764)) == u"逛活动页面领京豆(1/5)",
+      "%s" % (row_title(PANEL, (855, 1704, 970, 1764)),))
+check("E3 抽奖任务行没有京豆奖励",
+      reward_of(PANEL, (855, 1115, 970, 1176)) == (0, u""))
+check("E4 SK-II 广告行没有京豆奖励",
+      reward_of(PANEL, (855, 1313, 970, 1374)) == (0, u""))
+check("E5 享券后超低价行没有京豆奖励",
+      reward_of(PANEL, (855, 1509, 970, 1569)) == (0, u""))
+check("E6 浏览6S抽奖行没有京豆奖励",
+      reward_of(PANEL, (855, 2097, 970, 2158)) == (0, u""))
+check("E7 纯【完成得2京豆】也能命中",
+      reward_of(PANEL_SCROLL, (855, 2100, 970, 2160)) ==
+      (2, u"完成得2京豆"),
+      "%s" % (reward_of(PANEL_SCROLL, (855, 2100, 970, 2160)),))
+# 背景页价格文案与串行的京豆文案都不该抢配对
+_TRAP = PANEL + [
+    nd(u"¥269.00", 574, 1680, 745, 1745),
+    nd(u"到手价", 687, 1680, 794, 1745),
+    nd(u"完成得9京豆", 574, 1748, 800, 1784),
+]
+check("E8 背景页价格文案抢不走标题",
+      row_title(_TRAP, (855, 1704, 970, 1764)) == u"逛活动页面领京豆(1/5)")
+check("E9 背景页京豆文案抢不走奖励",
+      reward_of(_TRAP, (855, 1704, 970, 1764)) == (2, u"浏览完成得2京豆"))
+check("E10 上一行奖励不会被当成下一行标题",
+      row_title(PANEL, (855, 1899, 970, 1960)) == u"逛一逛活动得奖励(0/5)",
+      "%s" % (row_title(PANEL, (855, 1899, 970, 1960)),))
+check("E11 按钮上方 200px 的隔行标题不参与配对",
+      row_title(PANEL, (855, 2097, 970, 2158)) == u"天天抽盲盒领权益(0/5)",
+      "%s" % (row_title(PANEL, (855, 2097, 970, 2158)),))
+check("E12 空 nodes 返回空标题/零奖励",
+      row_title([], OK_B) == u"" and reward_of([], OK_B) == (0, u""))
+
+
+# ================================================================ F
+print("\n--- F. parse_rows 逐屏精确断言 ---")
+R_PANEL = parse_rows(PANEL)
+check("F1 首屏 2 个可做任务", len(R_PANEL) == 2, "%d" % len(R_PANEL))
+check("F2 首屏标题精确",
+      [r["title"] for r in R_PANEL] ==
+      [u"逛活动页面领京豆(1/5)", u"逛一逛活动得奖励(0/5)"],
+      "%s" % ([r["title"] for r in R_PANEL],))
+check("F3 首屏都是 2 京豆", [r["beans"] for r in R_PANEL] == [2, 2])
+check("F4 首屏按钮都是【去完成】",
+      [r["text"] for r in R_PANEL] == [u"去完成", u"去完成"])
+check("F5 首屏坐标", [r["bounds"] for r in R_PANEL] ==
+      [(855, 1704, 970, 1764), (855, 1899, 970, 1960)])
+_all_titles = u"|".join(r["title"] for r in R_PANEL)
+for i, bad in enumerate((u"完成任务获得抽奖机会", u"SK-II", u"享券后超低价",
+                         u"浏览6S获得抽奖机会", u"每日分享领红包"), 1):
+    check("F6.%d 排除非京豆任务 %s" % (i, bad), bad not in _all_titles)
+check("F7 所有行都在安全区内",
+      all(SAFE_TOP <= r["bounds"][1] and r["bounds"][3] <= SAFE_BOTTOM
+          for r in R_PANEL))
+
+R_SCROLL = parse_rows(PANEL_SCROLL)
+check("F8 滚动屏 4 个可做任务", len(R_SCROLL) == 4, "%d" % len(R_SCROLL))
+check("F9 滚动屏 y 精确",
+      [r["bounds"][1] for r in R_SCROLL] == [1121, 1316, 1905, 2100],
+      "%s" % ([r["bounds"][1] for r in R_SCROLL],))
+check("F10 滚动屏绝不返回被裁掉的 532/728/926 行",
+      all(r["bounds"][1] >= SAFE_TOP for r in R_SCROLL))
+check("F11 滚动屏含【浏览页面得京豆】",
+      any(u"浏览页面得京豆" in r["title"] for r in R_SCROLL))
+check("F12 滚动屏含纯【完成得2京豆】奖励",
+      any(r["reward"] == u"完成得2京豆" for r in R_SCROLL))
+
+R_S4 = parse_rows(PANEL_S4)
+check("F13 第 4 屏 5 个可做任务", len(R_S4) == 5, "%d" % len(R_S4))
+check("F14 第 4 屏全是 2 京豆", all(r["beans"] == 2 for r in R_S4))
+check("F15 任务池补位存在重复标题（必须靠上限兜底）",
+      len([r for r in R_S4 if u"逛活动页领京豆" in r["title"]]) == 2)
+
+R_BACK = parse_rows(AFTER_BACK)
+check("F16 浏览后 back 回到弹窗仍有 4 个可做任务", len(R_BACK) == 4)
+check("F17 浏览后进度 (1/5) -> (2/5)",
+      any(u"(2/5)" in r["title"] for r in R_BACK))
+check("F18 进度变化但台账 key 不变",
+      R_BACK[0]["key"] == R_SCROLL[0]["key"],
+      "%s vs %s" % (R_BACK[0]["key"], R_SCROLL[0]["key"]))
+for i, ns in enumerate((HOME, TEJIA, FLOAT, CENTER, NO_NODES, LANDING), 1):
+    check("F19.%d 非弹窗页 parse_rows 为空" % i, parse_rows(ns) == [])
+check("F20 空 nodes", parse_rows([]) == [])
+
+
+# ================================================================ G
+print("\n--- G. OCR 兜底通道 ---")
+check("G1 三张 OCR 夹具都识别到弹窗标题",
+      all(ocr_panel_visible(OCR[k]) for k in OCR))
+check("G2 空 OCR 结果不算弹窗", not ocr_panel_visible([]) and
+      not ocr_panel_visible(None))
+check("G3 无弹窗标题的 OCR 结果不产生任务",
+      parse_ocr_rows([{"text": u"首页", "x1": 100, "y1": 300,
+                       "x2": 200, "y2": 340, "cx": 150, "cy": 320}]) == [])
+O_PANEL = parse_ocr_rows(OCR["panel"])
+check("G4 OCR 首屏 2 个可做任务", len(O_PANEL) == 2, "%d" % len(O_PANEL))
+check("G5 OCR 首屏与 XML 通道标题一致",
+      [r["title"] for r in O_PANEL] == [r["title"] for r in R_PANEL],
+      "%s" % ([r["title"] for r in O_PANEL],))
+check("G6 OCR 首屏与 XML 通道 key 一致",
+      [r["key"] for r in O_PANEL] == [r["key"] for r in R_PANEL])
+check("G7 OCR 带 8+1 噪声仍能取到 2 京豆",
+      O_PANEL[0]["beans"] == 2 and u"8+1" in O_PANEL[0]["reward"])
+check("G8 OCR 排除抽奖任务",
+      all(u"抽奖" not in r["title"] and u"抽奖" not in r["reward"]
+          for r in O_PANEL))
+O_SCROLL = parse_ocr_rows(OCR["panel_scroll"])
+check("G9 OCR 滚动屏 4 个可做任务", len(O_SCROLL) == 4,
+      "%d" % len(O_SCROLL))
+check("G10 OCR 滚动屏与 XML 通道 y 接近（<=10px）",
+      all(abs(a["bounds"][1] - b["bounds"][1]) <= 10
+          for a, b in zip(O_SCROLL, R_SCROLL)))
+check("G11 OCR 全角括号不影响 key",
+      any(r["key"] == u"浏览页面得京豆|去完成" for r in O_SCROLL))
+O_S4 = parse_ocr_rows(OCR["panel_s4"])
+check("G12 OCR 第 4 屏能做出任务（OCR 误识别只丢 1 行）",
+      len(O_S4) == 4 and len(O_S4) <= len(R_S4))
+check("G13 OCR 行都在安全区",
+      all(in_list(r["bounds"]) for r in O_PANEL + O_SCROLL + O_S4))
+check("G14 OCR 通道按钮中心可直接用于 adb_tap",
+      O_PANEL[0]["center"] == ctr(O_PANEL[0]["bounds"]))
+
+
+# ================================================================ H
+print("\n--- H. panel_sig / ocr_sig ---")
+S_PANEL = panel_sig(PANEL)
+check("H1 弹窗首屏 7 个按钮进签名", len(S_PANEL) == 7,
+      "%d" % len(S_PANEL))
+check("H2 滚动后签名变化", S_PANEL != panel_sig(PANEL_SCROLL))
+check("H3 非弹窗页签名为空",
+      panel_sig(CENTER) == () and panel_sig(LANDING) == ())
+check("H4 签名是排序过的 tuple", isinstance(S_PANEL, tuple) and
+      list(S_PANEL) == sorted(S_PANEL))
+check("H5 进度变化不影响签名（按钮坐标不变）",
+      panel_sig(PANEL_SCROLL) == panel_sig(AFTER_BACK))
+S_OCR = ocr_sig(OCR["panel"])
+check("H6 OCR 签名非空", len(S_OCR) >= 6, "%d" % len(S_OCR))
+check("H7 OCR 签名稳定可比较", ocr_sig(OCR["panel"]) == S_OCR)
+check("H8 OCR 签名不含误读的【去元成】",
+      all(t != u"去元成" for t, _, _ in S_OCR))
+check("H9 空 OCR 签名为空", ocr_sig([]) == ())
+
+
+# ================================================================ I
+print("\n--- I. task_key / pick_target ---")
+k1 = task_key(u"逛活动页面领京豆(1/5)", u"去完成")
+k2 = task_key(u"逛活动页面领京豆(2/5)", u"去完成")
+k3 = task_key(u"逛活动页面领京豆（3/5）", u"去完成")
+check("I1 进度变化 key 不变", k1 == k2 == k3, "%s %s %s" % (k1, k2, k3))
+check("I2 不同标题 key 不同",
+      k1 != task_key(u"逛一逛活动得奖励(0/5)", u"去完成"))
+check("I3 不同按钮 key 不同", k1 != task_key(u"逛活动页面领京豆", u"去浏览"))
+check("I4 空标题也能成 key", bool(task_key(u"", u"去浏览", u"浏览完成得2京豆")))
+_rows = [{"key": x} for x in ("a", "b", "c")]
+check("I5 无黑名单挑第一行", pick_target(_rows, set(), {})["key"] == "a")
+check("I6 黑名单跳过", pick_target(_rows, {"a"}, {})["key"] == "b")
+check("I7 全拉黑返回 None", pick_target(_rows, {"a", "b", "c"}, {}) is None)
+check("I8 单任务次数达上限跳过",
+      pick_target(_rows, set(), {"a": MAX_PER_TASK})["key"] == "b")
+check("I9 自定义上限生效",
+      pick_target(_rows, set(), {"a": 1}, max_per_task=1)["key"] == "b")
+check("I10 空 rows 返回 None", pick_target([], set(), {}) is None)
+
+check("I11 进度 (4/5) 的任务允许第 4 次",
+      pick_target([{"key": "a", "title": u"逛活动页面领京豆(4/5)"}],
+                  set(), {"a": 3}) is not None)
+check("I12 进度 (0/6) 允许第 4~6 次也做",
+      pick_target([{"key": "a", "title": u"逛一逛领京豆(0/6)"}],
+                  set(), {"a": 3}) is not None and
+      pick_target([{"key": "a", "title": u"逛一逛领京豆(5/6)"}],
+                  set(), {"a": 5}) is not None)
+check("I13 进度做满 M 次后跳过",
+      pick_target([{"key": "a", "title": u"逛一逛领京豆(6/6)"}],
+                  set(), {"a": 6}) is None)
+check("I14 进度超大的任务按 MAX_PER_TASK_PROGRESS 封顶",
+      progress_total(u"看直播(3/20)") == 20 and
+      task_limit({"title": u"看直播(0/20)"}) == MAX_PER_TASK_PROGRESS)
+check("I15 中文括号进度也认", progress_total(u"浏览页面得京豆（2/7）") == 7)
+check("I16 无进度任务仍按 MAX_PER_TASK 封顶",
+      task_limit({"title": u"逛一逛活动得奖励"}) == MAX_PER_TASK and
+      pick_target([{"key": "a", "title": u"逛一逛活动得奖励"}],
+                  set(), {"a": MAX_PER_TASK}) is None)
+
+
+# ================================================================ I / J / K 替身
+class Log(object):
+    def __init__(self):
+        self.lines = []
+
+    def write_log(self, msg, level="INFO"):
+        self.lines.append((level, msg))
+
+    def done(self, msg=""):
+        self.lines.append(("DONE", msg))
+
+    def error(self, msg):
+        self.lines.append(("ERROR", msg))
+
+    def text(self):
+        return u"\n".join(u"[%s] %s" % (lv, m) for lv, m in self.lines)
+
+
+def to_ocr_items(nodes):
+    """把合成节点转成 task5_joy_trip.ocr_items() 的字典结构。"""
+    out = []
+    for n in nodes:
+        if not n["text"]:
+            continue
+        b = n["bounds"]
+        out.append({"text": n["text"], "x1": b[0], "y1": b[1],
+                    "x2": b[2], "y2": b[3], "cx": ctr(b)[0],
+                    "cy": ctr(b)[1]})
+    return out
+
+
+class SimUI(object):
+    """状态机替身：home -> tejia -> (float) -> center -> panel -> landing -> panel。"""
+    W = 1080
+    H = 2340
+
+    def __init__(self, bases=None, float_on_enter=False, blind=False,
+                 refill=False, verify_on_tap=False, lost_on_back=False,
+                 no_tasks=False, stop=None, stop_after=0, task_total=1):
+        self.bases = list(bases or [u"逛活动页面领京豆",
+                                    u"逛一逛活动得奖励",
+                                    u"浏览页面得京豆"])
+        self.tasks = [] if no_tasks else list(self.bases)
+        self.progress = {}
+        self.task_total = task_total
+        self.float_on_enter = float_on_enter
+        self.blind = blind
+        self.refill = refill
+        self.verify_on_tap = verify_on_tap
+        self.lost_on_back = lost_on_back
+        self.stop = stop
+        self.stop_after = stop_after
+        self.state = "home"
+        self.pending = None
+        self.taps = []
+        self.events = []
+        self.swipes = []
+        self.sleeps = []
+        self.backs = 0
+        self.browses = 0
+        self.panel_opens = 0
+        self.entry_taps = 0
+        self.tejia_taps = 0
+        self.coupon_taps = 0
+        self.float_taps = 0
+        self.ocr_calls = 0
+        self.invalidated = 0
+        self.shots = 0
+        self.source_calls = 0
+        self.source_states = []
+
+        class _D(object):
+            def get_screenshot_as_file(self, path):
+                pass
+        self.d = _D()
+
+    # -- 基础
+    def sx(self, x):
+        return x
+
+    def sy(self, y):
+        return y
+
+    def invalidate(self):
+        self.invalidated += 1
+
+    def source(self, fresh=False):
+        self.source_calls += 1
+        self.source_states.append(self.state)
+        return u"<dummy/>"
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        return not (self.stop is not None and self.stop.is_set())
+
+    def restart_to_home(self, wait=6):
+        self.state = "home"
+        return True
+
+    def goto_home(self, max_back=10):
+        self.state = "home"
+        return True
+
+    def adb_swipe(self, x1, y1, x2, y2, duration=300):
+        self.swipes.append((x1, y1, x2, y2, duration))
+
+    # -- 合成弹窗节点（与真机布局一致：标题 x=217，按钮 x=855）
+    def _panel_nodes(self):
+        out = [nd(u"领券中心", 0, 530, 1080, 2340, cls="WebView"),
+               nd(PANEL_MARK, 44, 882, 324, 956),
+               nd(u"每日最高可领1000京豆", 44, 959, 401, 1000),
+               nd(u"更多任务", 22, 821, 225, 1113,
+                  clickable=True, cls="Button")]
+        rows = list(self.tasks) + [u"天天抽盲盒领权益"]
+        for i, t in enumerate(rows):
+            y = 1115 + i * 196
+            if y + 61 > SAFE_BOTTOM:
+                break
+            done = self.progress.get(t, 0)
+            title = t + u" (%d/%d)" % (done, self.task_total)
+            reward = (u"浏览完成得2京豆" if t in self.tasks
+                      else u"浏览6S获得抽奖机会")
+            full = t in self.tasks and done >= self.task_total
+            out += [nd(title, 217, y - 24, 781, y + 20),
+                    nd(reward, 217, y + 44, 481, y + 83),
+                    nd(u"已完成" if full else u"去完成",
+                       855, y, 970, y + 61),
+                    nd(u"", 811, y - 16, 1012, y + 80,
+                       clickable=True, cls="View")]
+        return out
+
+    def ocr_items(self):
+        """截图 OCR 替身：只有面板真的在场时才吐出【做任务得奖励】。
+
+        面板被关掉（lost / center）时必须吐底页文字，否则会假装面板还在，
+        掩盖掉「back 回不来要重建入口」这条恢复链路。
+        """
+        self.ocr_calls += 1
+        if self.state in ("panel", "blind"):
+            return to_ocr_items(self._panel_nodes())
+        return [{"text": u"领券中心", "x1": 453, "y1": 458,
+                 "x2": 627, "y2": 510, "cx": 540, "cy": 484},
+                {"text": u"更多任务", "x1": 22, "y1": 821,
+                 "x2": 225, "y2": 1113, "cx": 123, "cy": 967}]
+
+    def nodes(self, xml=None):
+        if self.state == "home":
+            return HOME
+        if self.state == "tejia":
+            return TEJIA
+        if self.state == "float":
+            return FLOAT
+        if self.state in ("center", "lost"):
+            return CENTER
+        if self.state == "blind":
+            return NO_NODES
+        if self.state == "panel":
+            return self._panel_nodes()
+        if self.state == "landing":
+            return LANDING
+        if self.state == "verify":
+            return VERIFY
+        return [nd(u"未知页面", 100, 300, 900, 400)]
+
+    # -- 交互
+    def back(self, pause=2.0):
+        self.backs += 1
+        if self.state == "landing":
+            self._finish_pending()
+            if self.verify_on_tap:
+                self.state = "verify"
+            elif self.lost_on_back:
+                self.state = "lost"
+            else:
+                self.state = "blind" if self.blind else "panel"
+        elif self.state in ("panel", "blind"):
+            self.state = "center"
+        elif self.state in ("center", "lost", "float", "verify"):
+            self.state = "tejia"
+        elif self.state == "tejia":
+            self.state = "home"
+        return True
+
+    def _finish_pending(self):
+        t = self.pending
+        self.pending = None
+        if t is None:
+            return
+        self.browses += 1
+        self.events.append("browse")
+        self.progress[t] = self.progress.get(t, 0) + 1
+        # 真机不做删除：行留在原位，做满后按钮变【已完成】
+        if self.stop_after and self.browses >= self.stop_after and self.stop:
+            self.stop.set()
+
+    def adb_tap(self, pos, pause=1.5, settle=None):
+        p = (int(pos[0]), int(pos[1]))
+        self.taps.append(p)
+        if self.state == "home":
+            if p == ctr(TOP_TAB):
+                self.state = "tejia"
+                self.tejia_taps += 1
+                self.events.append("tejia")
+            return
+        if self.state == "tejia":
+            if p == ctr(COUPON_TAB_BOX):
+                self.state = "float" if self.float_on_enter else "center"
+                self.coupon_taps += 1
+                self.events.append("center")
+            return
+        if self.state == "float":
+            if p == FLOAT_CLOSE_XY:
+                self.state = "center"
+                self.float_taps += 1
+                self.events.append("clear_float")
+            return
+        if self.state in ("center", "lost"):
+            if p == ENTRY_PT:
+                self.state = "blind" if self.blind else "panel"
+                self.panel_opens += 1
+                self.entry_taps += 1
+                self.events.append("open_panel")
+            return
+        if self.state in ("panel", "blind"):
+            for i, t in enumerate(self.tasks):
+                y = 1115 + i * 196
+                if p == ctr((855, y, 970, y + 61)):
+                    self.state = "landing"
+                    self.pending = t
+                    self.events.append("tap_task")
+                    return
+
+
+def run_sim(sim, stop=None, max_tasks=None, max_ocr=500):
+    """用替身跑完整 run()，不连设备（同时 mock JDUI 与 utils.driver）。"""
+    old_driver = MOD.driver
+    old_jdui = MOD.JDUI
+    old_max = MOD.MAX_TASKS
+    old_ocr_max = MOD.MAX_OCR
+    old_shot = MOD.SHOT_HOOK
+    old_ocr = MOD.OCR_HOOK
+    import utils.driver as _drv
+    old_get = _drv.get_driver
+    guard = {"calls": 0}
+
+    class FakeDriver(object):
+        @staticmethod
+        def get_driver():
+            return None
+
+    def _guard_get_driver():
+        guard["calls"] += 1
+        raise AssertionError("回归里不该真建 Appium session")
+
+    MOD.driver = FakeDriver()
+    MOD.JDUI = lambda *a, **kw: sim
+    _drv.get_driver = _guard_get_driver
+    MOD.SHOT_HOOK = lambda ui: "_fixture_coupon_panel.png"
+    MOD.OCR_HOOK = lambda path: sim.ocr_items()
+    if max_tasks is not None:
+        MOD.MAX_TASKS = max_tasks
+    MOD.MAX_OCR = max_ocr
+    log = Log()
+    try:
+        Task14Coupons().run(log, stop or threading.Event())
+    finally:
+        MOD.driver = old_driver
+        MOD.JDUI = old_jdui
+        _drv.get_driver = old_get
+        MOD.MAX_TASKS = old_max
+        MOD.MAX_OCR = old_ocr_max
+        MOD.SHOT_HOOK = old_shot
+        MOD.OCR_HOOK = old_ocr
+    return log, guard
+
+
+# ================================================================ J
+print("\n--- J. 模块方法 ---")
+m = Task14Coupons()
+sim0 = SimUI()
+m.ui = sim0
+m.log = Log()
+m.stop = threading.Event()
+check("J1 _top_tab 动态定位一级 tab", m._top_tab(HOME) == TOP_TAB,
+      "%s" % (m._top_tab(HOME),))
+check("J2 _coupon_tab 取到可点父容器",
+      m._coupon_tab(TEJIA) == COUPON_TAB_BOX,
+      "%s" % (m._coupon_tab(TEJIA),))
+check("J3 _find_entry 找到【更多任务】卡片",
+      m._find_entry(CENTER) == ENTRY_BTN,
+      "%s" % (m._find_entry(CENTER),))
+check("J4 _clickable_container 无容器返回 None",
+      m._clickable_container((10, 10, 20, 20),
+                             [nd(u"x", 10, 10, 20, 20)]) is None)
+# J5~J11 注入 OCR 替身，避免回归去加载 PaddleOCR / 真机截图
+_old_shot, _old_ocr = MOD.SHOT_HOOK, MOD.OCR_HOOK
+MOD.SHOT_HOOK = lambda ui: "_fixture_coupon_panel.png"
+MOD.OCR_HOOK = lambda path: sim0.ocr_items()
+sim0.state = "center"
+m.expect_panel = False
+m.panel_believed = False
+m.ocr_calls = 0
+p0 = m._probe()
+check("J5 未点入口的 center 帧不误判成弹窗，也不跑 OCR",
+      p0["state"] == "center" and p0["rows"] == [] and
+      p0["src"] == "xml" and m.ocr_calls == 0,
+      "%s / %d" % (p0["src"], m.ocr_calls))
+m.expect_panel = True
+m.panel_believed = True
+sim0.state = "blind"
+p1 = m._probe()
+check("J6 面板不进无障碍树（盲帧）时靠截图 OCR 判成 panel",
+      p1["state"] == "panel" and p1["src"] == "ocr", p1["src"])
+check("J7 盲帧 OCR 拿到 3 个可做任务", len(p1["rows"]) == 3,
+      "%d" % len(p1["rows"]))
+check("J8 面板在场时不 dump XML（nodes 为空，省 2~9s）", p1["nodes"] == [])
+p2 = m._probe()
+check("J9 下一帧仍然只花 1 次 OCR（不靠会过期的缓存）",
+      m.ocr_calls == 2 and p2["src"] == "ocr",
+      "%d %s" % (m.ocr_calls, p2["src"]))
+check("J10 每帧都重新截图 OCR，行数据永远是最新的",
+      [r["key"] for r in p2["rows"]] == [r["key"] for r in p1["rows"]])
+check("J11 OCR 预算被扣减", m.ocr_budget == MAX_OCR - 2,
+      "%d" % m.ocr_budget)
+sim0.state = "center"
+p3 = m._probe()
+check("J11b 面板关掉后立刻判 center（不会把面板当还在）",
+      p3["state"] == "center" and p3["rows"] == [] and
+      m.panel_believed is False, p3["state"])
+sim0.state = "panel"
+m.panel_believed = True
+p4 = m._probe()
+check("J11c 面板重新在场又能立刻认回来", p4["state"] == "panel",
+      p4["state"])
+check("J11d 面板不在时 _probe 不浪费 OCR（center 才补一次判定）",
+      m.ocr_calls == 4, "%d" % m.ocr_calls)
+MOD.SHOT_HOOK, MOD.OCR_HOOK = _old_shot, _old_ocr
+
+m2 = Task14Coupons()
+sim2 = SimUI(float_on_enter=True)
+m2.ui = sim2
+m2.log = Log()
+m2.stop = threading.Event()
+# 这一段的 _open_panel 会截图，必须注入替身，否则会去截真机
+_j_shot, _j_ocr = MOD.SHOT_HOOK, MOD.OCR_HOOK
+MOD.SHOT_HOOK = lambda ui: "_fixture_coupon_panel.png"
+MOD.OCR_HOOK = lambda path: sim2.ocr_items()
+check("J12 _reach_center 从首页走到领券中心（顺手关掉浮层）",
+      m2._reach_center() and sim2.state == "center" and
+      sim2.float_taps >= 1 and sim2.tejia_taps >= 1 and
+      sim2.coupon_taps >= 1,
+      "%s %d %d %d" % (sim2.state, sim2.float_taps,
+                       sim2.tejia_taps, sim2.coupon_taps))
+sim2.state = "float"
+check("J13 _clear_float 点 X 后回到 center", m2._clear_float() and
+      sim2.state == "center" and sim2.float_taps >= 2)
+check("J14 _tap_entry 点在卡片下缘【领更多】",
+      (m2._tap_entry(ENTRY_BTN), sim2.taps[-1])[1] == ENTRY_PT)
+sim2.state = "center"
+sim2.panel_opens = 0
+check("J15 _open_panel 从 center 打开面板",
+      m2._open_panel() and sim2.state == "panel" and
+      sim2.panel_opens == 1)
+MOD.SHOT_HOOK, MOD.OCR_HOOK = _j_shot, _j_ocr
+
+
+# ================================================================ K
+print("\n--- K. 完整 run() 状态机 ---")
+sim = SimUI()
+log, guard = run_sim(sim)
+check("K1 正常流程 log.done 被调用",
+      any(lv == "DONE" for lv, _ in log.lines))
+check("K2 没有 ERROR", not any(lv == "ERROR" for lv, _ in log.lines))
+check("K3 冷启动后走完整入口链路",
+      sim.tejia_taps >= 1 and sim.coupon_taps >= 1 and sim.entry_taps >= 1,
+      "%s" % ((sim.tejia_taps, sim.coupon_taps, sim.entry_taps),))
+check("K4 3 个可做任务全做完（(0/1) 各做 1 次）",
+      sim.browses == 3, "%d" % sim.browses)
+check("K5 每个任务恰好一次 back（收尾刷新最多多 1 次）",
+      0 <= sim.backs - sim.browses <= 1,
+      "%d vs %d" % (sim.backs, sim.browses))
+check("K6 面板只在开局开 1 次 + 收尾刷新 1 次（不是每个任务都重建）",
+      sim.panel_opens <= 2, "%d" % sim.panel_opens)
+check("K7 日志报告 3 次浏览",
+      any(u"完成 3 次" in msg for lv, msg in log.lines if lv == "DONE"),
+      log.text()[-300:])
+check("K8 没有真建 Appium session", guard["calls"] == 0)
+check("K9 自然终态：日志有「没有可做任务」",
+      u"任务列表已没有可做任务" in log.text())
+check("K10 所有停留秒数落在 9~10",
+      all(9 <= s <= 10 for s in sim.sleeps if s >= 8),
+      "%s" % ([s for s in sim.sleeps if s >= 8],))
+
+sim_f = SimUI(float_on_enter=True)
+log_f, _ = run_sim(sim_f)
+check("K11 浮层场景先关浮层再做任务",
+      sim_f.float_taps >= 1 and sim_f.browses == 3,
+      "%d / %d" % (sim_f.float_taps, sim_f.browses))
+check("K12 浮层场景正常收尾",
+      any(lv == "DONE" for lv, _ in log_f.lines))
+
+sim_b = SimUI(blind=True)
+log_b, _ = run_sim(sim_b)
+check("K13 盲帧场景确实调用了 OCR 兜底", sim_b.ocr_calls > 0,
+      "%d" % sim_b.ocr_calls)
+check("K14 盲帧场景也做完 3 个任务", sim_b.browses == 3,
+      "%d" % sim_b.browses)
+check("K15 盲帧场景正常收尾",
+      any(u"完成 3 次" in msg for lv, msg in log_b.lines if lv == "DONE"),
+      log_b.text()[-300:])
+check("K16 盲帧场景点的是 OCR 行长出的按钮中心",
+      any(p == ctr((855, 1115, 970, 1176)) for p in sim_b.taps))
+
+sim_r = SimUI(refill=True, task_total=5)
+log_r, _ = run_sim(sim_r)
+check("K17 带 (N/5) 进度的任务会做到 5/5，且不会死循环",
+      sim_r.browses == len(sim_r.bases) * 5,
+      "%d" % sim_r.browses)
+check("K18 补位场景正常收尾",
+      any(lv == "DONE" for lv, _ in log_r.lines))
+
+sim_v = SimUI(verify_on_tap=True)
+log_v, _ = run_sim(sim_v)
+check("K19 风控页立即停止，不再继续做任务", sim_v.browses == 1,
+      "%d" % sim_v.browses)
+check("K20 风控页有明确告警", u"京东验证" in log_v.text())
+
+sim_l = SimUI(lost_on_back=True)
+log_l, _ = run_sim(sim_l)
+check("K21 back 回不来时重建弹窗而不是掐断整轮",
+      sim_l.browses == 3 and sim_l.entry_taps >= 4,
+      "%d / %d" % (sim_l.browses, sim_l.entry_taps))
+check("K22 重建场景正常收尾",
+      any(lv == "DONE" for lv, _ in log_l.lines))
+
+ev = threading.Event()
+sim_s = SimUI(stop=ev, stop_after=2)
+log_s, _ = run_sim(sim_s, stop=ev)
+check("K23 stop_event 能中断循环", sim_s.browses == 2 and ev.is_set(),
+      "%d / %s" % (sim_s.browses, ev.is_set()))
+check("K24 中断后仍然 log.done",
+      any(lv == "DONE" for lv, _ in log_s.lines))
+
+sim_cap = SimUI(refill=True)
+log_cap, _ = run_sim(sim_cap, max_tasks=2)
+check("K25 MAX_TASKS 硬上限生效", sim_cap.browses == 2,
+      "%d" % sim_cap.browses)
+check("K26 触顶有告警", u"已达总浏览次数上限" in log_cap.text())
+
+sim_e = SimUI(no_tasks=True)
+log_e, _ = run_sim(sim_e)
+check("K27 开局就没有京豆任务时 0 次浏览直接收尾",
+      sim_e.browses == 0 and
+      any(u"完成 0 次" in msg for lv, msg in log_e.lines if lv == "DONE"),
+      log_e.text()[-300:])
+
+
+# ================================================================ L
+print("\n--- L. 需求合规 ---")
+_task_pts = set(ctr((855, 1115 + i * 196, 970, 1115 + i * 196 + 61))
+                for i in range(len(sim.bases)))
+_tapped_tasks = [p for p in sim.taps if p in _task_pts]
+check("L1 所有任务点击都落在【完成得Y京豆】行按钮上",
+      len(_tapped_tasks) == sim.browses == 3,
+      "%s" % (sim.taps,))
+_noise_pt = ctr((855, 1115 + 3 * 196, 970, 1115 + 3 * 196 + 61))
+check("L2 抽奖任务行的按钮一次都没点", _noise_pt not in sim.taps)
+check("L3 每次浏览的停留秒数都是 9~10（按需求 9 秒起）",
+      len([s for s in sim.sleeps if 9 <= s <= 10]) == sim.browses,
+      "%s" % ([s for s in sim.sleeps if s >= 8],))
+check("L4 点击后只 back 一次再回弹窗（收尾刷新除外）",
+      sim.events.count("tap_task") == sim.events.count("browse") and
+      0 <= sim.backs - sim.browses <= 1)
+check("L5 循环终止条件是「扫完没有可做任务」，不是固定次数",
+      u"任务列表已没有可做任务" in log.text() and
+      ("MAX_CYCLES" in SRC or "MAX_PASSES" in SRC) and "done == 0" in SRC)
+check("L6 没有写死浏览时长常量",
+      not re.search(r"sleep\(\s*(12|13|14|15)\s*\)", SRC))
+check("L7 源码明确排除抽奖类任务",
+      u"完成任务获得抽奖机会" in SRC and u"浏览6S获得抽奖机会" in SRC)
+check("L8 源码有 OCR 兜底但预算封顶",
+      "MAX_OCR" in SRC and "ocr_budget" in SRC)
+check("L9 源码用短滑动避免滚掉弹窗",
+      "SWIPE_UP" in SRC and "1600" in SRC)
+check("L10 源码有进度归一化 key（补位任务不会死循环）",
+      "PROGRESS_RE.sub" in SRC and "attempts" in SRC)
+
+
+# ================================================================ N
+print("\n--- N. v3 稳定性 / 提速 ---")
+check("N1 源码里任务循环不再 dump XML（无 force_xml 兜底）",
+      "force_xml=True)" not in SRC.split("def _do_one")[1].split(
+          "def _refresh_panel")[0],
+      "任务循环还有 XML 兜底")
+check("N2 点击等待不再叠加两次 pause（用 settle=0）",
+      "settle=0" in SRC and "settle=None" in SRC)
+
+
+class _Gone(object):
+    """adb 掉线时的替身：设备列表为空。"""
+
+    def __init__(self):
+        self.online_calls = 0
+        self.reconnect_calls = 0
+
+    def online(self, adb):
+        self.online_calls += 1
+        return False
+
+    def reconnect(self, adb, wait=None):
+        self.reconnect_calls += 1
+        return False
+
+
+g = _Gone()
+_old_online, _old_reconnect, _old_adbpath = (
+    MOD._device_online, MOD._adb_reconnect, MOD.adb_path)
+MOD._device_online = g.online
+MOD._adb_reconnect = g.reconnect
+MOD.adb_path = lambda: "adb"
+try:
+    gd = {"calls": 0}
+
+    class _D2(object):
+        @staticmethod
+        def get_driver():
+            gd["calls"] += 1
+            raise AssertionError("断连时不该去建 session")
+
+    m3 = Task14Coupons()
+    m3.ui = SimUI()
+    m3.log = Log()
+    m3.stop = threading.Event()
+    _old_drv = MOD.driver
+    MOD.driver = _D2()
+    try:
+        r = m3._revive()
+    finally:
+        MOD.driver = _old_drv
+    check("N3 adb 里没设备时 _revive 立刻放弃（不干等 20s 建 session）",
+          r is False and gd["calls"] == 0, "%s / %s" % (r, gd["calls"]))
+    check("N4 断连会先试一次 reconnect", g.reconnect_calls == 1,
+          "%d" % g.reconnect_calls)
+    check("N5 断连时置 _dead，后续 _snap 不再读屏", m3._dead is True)
+    t0 = time.time()
+    st, nodes = m3._snap()
+    check("N6 已 _dead 时 _snap 直接返回不读屏",
+          st == "other" and nodes == [] and time.time() - t0 < 0.05)
+    check("N7 断连日志明确提示插好 USB",
+          u"USB" in m3.log.text())
+finally:
+    MOD._device_online, MOD._adb_reconnect, MOD.adb_path = (
+        _old_online, _old_reconnect, _old_adbpath)
+
+
+class _Never(object):
+    """设备在，但 session 一直建不起来。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def online(self, adb):
+        return True
+
+
+nv = _Never()
+_old_online = MOD._device_online
+MOD._device_online = nv.online
+MOD.adb_path = lambda: "adb"
+_old_drv = MOD.driver
+
+
+class _BoomDriver(object):
+    @staticmethod
+    def get_driver():
+        raise RuntimeError("boom")
+
+
+MOD.driver = _BoomDriver()
+try:
+    m4 = Task14Coupons()
+    m4.ui = SimUI()
+    m4.log = Log()
+    m4.stop = threading.Event()
+    res = [m4._revive() for _ in range(4)]
+finally:
+    MOD.driver = _old_drv
+    MOD._device_online = _old_online
+    MOD.adb_path = _old_adbpath
+check("N8 Appium 重连次数封顶，不会无限重试吃满时间",
+      res[0] is False and res[1] is False and res[2] is False and
+      res[3] is False and m4.revives == MOD.MAX_REVIVE,
+      "%s revives=%d" % (res, m4.revives))
+
+
+sim_x = SimUI()
+log_x, _ = run_sim(sim_x)
+_bad = [st for st in sim_x.source_states if st in ("panel", "blind", "landing")]
+# 开局那一帧还不知道停在哪，允许读一次 XML 摸状态；之后面板/落地页期间必须零 XML
+check("N9 面板/落地页期间不 dump XML（开局摸状态那帧除外）",
+      len(_bad) <= 1 and sim_x.browses == 3,
+      "读到 %d 次: %s" % (len(_bad), _bad[:5]))
+check("N10 换成纯像素通道后仍然做完 3 个任务",
+      sim_x.browses == 3, "%d" % sim_x.browses)
+
+
+# ================================================================ P
+print("\n--- P. 新布局（入口卡=【立即领奖】）---")
+check("P1 新布局夹具仍判定为 center", classify(CENTER2) == "center",
+      classify(CENTER2))
+mp = Task14Coupons()
+mp.ui = SimUI()
+mp.log = Log()
+mp.stop = threading.Event()
+E2 = (22, 821, 225, 1113)
+check("P2 新布局能定位到入口卡（resource-id / 几何兜底）",
+      mp._find_entry(CENTER2) == E2, "%s" % (mp._find_entry(CENTER2),))
+
+_no_res = [dict(n, res="") for n in CENTER2]
+check("P3 丢掉 resource-id 后靠文案【立即领奖】仍能定位",
+      mp._find_entry(_no_res) == E2, "%s" % (mp._find_entry(_no_res),))
+
+_no_text = [dict(n, text="", desc="", res="") for n in CENTER2]
+check("P4 文案和 id 都没有时靠几何兜底仍能定位",
+      mp._find_entry(_no_text) == E2, "%s" % (mp._find_entry(_no_text),))
+
+check("P5 旧布局夹具照旧命中（不能为新版牺牲老版）",
+      mp._find_entry(CENTER) == (22, 821, 225, 1113),
+      "%s" % (mp._find_entry(CENTER),))
+
+_junk = [nd(u"限时加补券", 490, 900, 1012, 1000, clickable=True),
+         nd(u"推荐", 42, 1140, 140, 1200, clickable=True)]
+check("P6 几何兜底不会把右半屏/矮卡片误认成入口",
+      mp._entry_geo(_junk) is None, "%s" % (mp._entry_geo(_junk),))
+
+check("P7 _tap_entry 点在卡片下缘（真机那半张卡是整块 Button）",
+      (E2[0] + E2[2]) // 2 == 123 and E2[3] - 48 == 1065,
+      "tap=(%d,%d)" % ((E2[0] + E2[2]) // 2, E2[3] - 48))
+
+
+# ================================================================ Q
+print("\n--- Q. v3.2 提速 ---")
+mq = Task14Coupons()
+sq = SimUI()
+sq.state = "panel"
+mq.ui = sq
+mq.log = Log()
+mq.stop = threading.Event()
+mq.panel_believed = True
+mq.expect_panel = True
+_ocr0 = sq.ocr_calls
+mq.scrolled = True
+mq._to_top()
+check("Q1 回顶判「到没到顶」不再烧整帧 OCR",
+      sq.ocr_calls == _ocr0, "OCR 多跑了 %d 次" % (sq.ocr_calls - _ocr0))
+check("Q2 回顶会真的往下滑（没滑过就不动）",
+      len(sq.swipes) >= 1, "%d" % len(sq.swipes))
+sq2 = SimUI()
+mq2 = Task14Coupons()
+mq2.ui = sq2
+mq2.log = Log()
+mq2.stop = threading.Event()
+mq2.scrolled = False
+_before = len(sq2.swipes)
+mq2._to_top()
+check("Q3 没滑过列表时不回顶（避免把半屏 sheet 拖关）",
+      len(sq2.swipes) == _before, "%d" % len(sq2.swipes))
+
+mr = Task14Coupons()
+sr = SimUI()
+sr.state = "center"
+sr.panel_opens = 0
+mr.ui = sr
+mr.log = Log()
+mr.stop = threading.Event()
+mr._entry_bounds = ENTRY_BTN
+mr.panel_believed = False
+mr.expect_panel = False
+_ocr1 = sr.ocr_calls
+_ok = mr._reopen_fast()
+check("Q4 弹窗被带关时直接点缓存入口卡重开（不跑整轮状态机）",
+      _ok is True and sr.state == "panel" and sr.panel_opens == 1,
+      "%s %s %d" % (_ok, sr.state, sr.panel_opens))
+check("Q5 重开只用一次标题条 OCR（≈1.5s），不是整帧",
+      sr.ocr_calls - _ocr1 <= 2, "%d" % (sr.ocr_calls - _ocr1))
+
+mr2 = Task14Coupons()
+sr2 = SimUI()
+sr2.state = "center"
+mr2.ui = sr2
+mr2.log = Log()
+mr2.stop = threading.Event()
+mr2._entry_bounds = None          # 没有缓存坐标 → 退回完整状态机
+_ok2 = mr2._reopen_fast()
+check("Q6 没有缓存坐标时仍能重开（退回 _open_panel）",
+      _ok2 is True and sr2.state == "panel", "%s %s" % (_ok2, sr2.state))
+
+ml = Task14Coupons()
+ml.log = Log()
+ml.attempts = {task_key(u"逛一逛活动得奖励", u"去完成"): 5}
+_rows = [{"key": task_key(u"逛一逛活动得奖励", u"去完成"),
+          "title": u"逛一逛活动得奖励(0/5)", "reward": u"浏览完成得2京豆",
+          "text": u"去完成", "beans": 2, "bounds": (855, 1115, 970, 1176)},
+         {"key": task_key(u"浏览会场得京豆", u"去完成"),
+          "title": u"浏览会场得京豆(0/6)", "reward": u"浏览完成得2京豆",
+          "text": u"去完成", "beans": 2, "bounds": (855, 1311, 970, 1372)}]
+ml._report_left(_rows)
+_txt = ml.log.text()
+check("Q7 收尾把「一次都没开始」和「做了没做满」分开说",
+      u"一次都没做" in _txt and u"做了但没做满" in _txt
+      and u"浏览会场得京豆(0/6)" in _txt.split(u"一次都没做")[1],
+      _txt[-220:])
+
+
+print("\n================ 汇总 ================")
+print("PASS %d / FAIL %d / TOTAL %d" %
+      (len(PASSED), len(FAILED), len(PASSED) + len(FAILED)))
+if FAILED:
+    print("FAILED LIST:")
+    for f in FAILED:
+        print("  - %s" % f)
+    sys.exit(1)
+print("ALL GREEN")

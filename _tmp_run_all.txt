@@ -1,0 +1,36 @@
+# -*- coding: utf-8 -*-
+import glob, subprocess, re, io, os, sys
+
+PY = r"D:\Program Files\Python37\python.exe"
+files = sorted(glob.glob("_test_*.py"))
+print("共 %d 套回归" % len(files))
+print("")
+failed_suites = []
+for f in files:
+    try:
+        p = subprocess.Popen([PY, f], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        out = p.communicate()[0].decode("utf-8", "replace")
+        rc = p.returncode
+    except Exception as e:
+        out = "EXC %s" % e
+        rc = -1
+    lines = out.splitlines()
+    summary = [x for x in lines if re.search(
+        r"PASS \d+, FAIL|ALL PASS|passed, .*failed|Traceback|FAILED:", x)]
+    # 取最后几行汇总
+    tail = summary[-6:] if summary else lines[-4:]
+    ok = (rc == 0)
+    flag = "OK " if ok else "BAD"
+    print("[%s] %-30s rc=%d  %s" % (flag, f, rc, " | ".join(tail[-3:])))
+    if not ok:
+        failed_suites.append(f)
+        print("      ---- 失败明细 ----")
+        for x in summary[-12:]:
+            print("      " + x[:200])
+        print("      ---- 末尾输出 ----")
+        for x in lines[-8:]:
+            print("      " + x[:200])
+print("")
+print("通过 %d / %d 套" % (len(files) - len(failed_suites), len(files)))
+print("未通过: %s" % (", ".join(failed_suites) if failed_suites else "无"))
